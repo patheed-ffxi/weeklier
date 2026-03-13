@@ -1,0 +1,39 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Package addon
+        run: |
+          mkdir -p release/weeklier/data
+          cp weeklier.lua release/weeklier/
+          cp data/key_item.lua release/weeklier/data/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weeklier
+          path: release/
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release
+          zip -r ../weeklier.zip weeklier/
+          cd ..
+          gh release create "${{ github.ref_name }}" weeklier.zip --generate-notes
