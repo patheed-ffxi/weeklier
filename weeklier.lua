@@ -599,7 +599,7 @@ local function ensure_char(name)
                     else
                         data[name].quests[q.name] = 'NOT STARTED'
                     end
-                    dlog(string.format('  Reset %s: COMPLETED -> %s', q.name, data[name].quests[q.name]))
+                    log(string.format('  Reset %s: COMPLETED -> %s', q.name, data[name].quests[q.name]))
                 end
             end
         end
@@ -1136,8 +1136,7 @@ local function render_ui()
                                     status = derive_quest_status(q, stored_status)
                                     -- Persist derived status so it's visible on other chars
                                     if status ~= stored_status then
-                                        dlog(string.format('Persisting derived status [%s]: %s -> %s',
-                                            q.name, stored_status, status))
+                                        log(string.format('%s: %s -> %s', q.name, stored_status, status))
                                         cd.quests[q.name] = status
                                         save_data()
                                     end
@@ -1181,6 +1180,10 @@ local function render_ui()
                                     local r = eco_statuses[ew.key]
                                     if not cd.eco[ew.key] then cd.eco[ew.key] = {} end
                                     if cd.eco[ew.key].stored_status ~= r.status then
+                                        log(string.format('Eco %s: %s -> %s',
+                                            ew.nation,
+                                            cd.eco[ew.key].stored_status or 'nil',
+                                            r.status))
                                         cd.eco[ew.key].stored_status = r.status
                                         eco_changed = true
                                     end
@@ -1857,8 +1860,13 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb', function(e)
                         local has = has_key_item(ki_id)
                         if not cd.enms[q.name] then cd.enms[q.name] = {} end
                         if cd.enms[q.name].has_ki ~= has then
+                            local prev_has = cd.enms[q.name].has_ki
                             cd.enms[q.name].has_ki = has
                             changed = true
+                            -- Only log when transitioning from a known state (not initial load)
+                            if prev_has ~= nil then
+                                log(string.format('ENM KI %s: %s', has and 'obtained' or 'lost', q.name))
+                            end
                             dlog(string.format('ENM KI persisted [%s]: has_ki=%s', q.name, tostring(has)))
                         end
                     end
