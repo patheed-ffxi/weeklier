@@ -116,7 +116,7 @@ local QUESTS = {
         name                = 'Secrets of Ovens Lost',
         -- quest is bugged and always shows as active
         ki_quest_incomplete = 'TAVNAZIAN_COOKBOOK',
-        flag_phrase = ''
+        flag_phrase = 'if you happen to find any more, the children would be so delighted'
     },
     {
         name                = 'Uninvited Guests',
@@ -128,7 +128,10 @@ local QUESTS = {
         name                = 'Spice Gals',
         -- No quest_log_id/quest_id: quest is bugged and doesn't appear in active quests.
         ki_quest_incomplete = 'RIVERNEWORT',
-        flag_phrase         = 'you find yourself in possession of a sprig of Rivernewort, then I should dearly love to prepare',
+        flag_phrase         = {
+            'you find yourself in possession of a sprig of Rivernewort, then I should dearly love to prepare',
+            'it would be much appreciated if you might stop and collect another sprig of Rivernewort'
+        }
     },
     {
         name                    = 'Requiem of Sin',
@@ -250,7 +253,7 @@ local ECO_WARRIORS = {
         quest_log_id        = 0,
         quest_id            = 97,
         ki_quest_incomplete = 'INDIGESTED_STALAGMITE',
-        flag_phrase         = '',  -- TODO: fill in the chat phrase when known
+        flag_phrase         = 'Rojaireaut, our V.E.R.M.I.N. agent in the field, will be waiting for you in the caves'
     },
     {
         nation              = 'Bastok',
@@ -258,7 +261,7 @@ local ECO_WARRIORS = {
         quest_log_id        = 1,
         quest_id            = 65,
         ki_quest_incomplete = 'INDIGESTED_ORE',
-        flag_phrase         = '',  -- TODO: fill in the chat phrase when known
+        flag_phrase         = 'Degga, one of our V.E.R.M.I.N. field agents, will give you further instructions'
     },
     {
         nation              = 'Windurst',
@@ -266,7 +269,7 @@ local ECO_WARRIORS = {
         quest_log_id        = 2,
         quest_id            = 84,
         ki_quest_incomplete = 'INDIGESTED_MEAT',
-        flag_phrase         = '',  -- TODO: fill in the chat phrase when known
+        flag_phrase         = 'Our V.E.R.M.I.N. field agent, Ahko Mhalijikhari, will be waiting in the maze'
     },
 }
 
