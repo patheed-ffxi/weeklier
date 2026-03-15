@@ -111,8 +111,9 @@ local debug_mode = false
 local QUESTS = {
     {
         name                = 'Secrets of Ovens Lost',
-        quest_log_id        = 4,
-        quest_id            = 73,
+        -- quest is bugged and always shows as active
+        --quest_log_id        = 4,
+        --quest_id            = 73,
         ki_quest_incomplete = 'TAVNAZIAN_COOKBOOK',
     },
     {
@@ -214,16 +215,28 @@ local QUESTS = {
 -- be repeated. e.g. if you do Sandy week 1, you must do Bastok or Windy week 2
 -- before you can do Sandy again.
 --
+-- Fields:
+--   nation              : display name
+--   key                 : unique key for storage/lookup
+--   quest_log_id        : numeric log ID for is_quest_active() (may be bugged)
+--   quest_id            : numeric quest ID for is_quest_active() (may be bugged)
+--   ki_quest_incomplete : KI name indicating quest is in progress (ready to turn in)
+--   flag_phrase         : chat phrase to detect quest being flagged (alternative to
+--                         quest_log_id/quest_id for bugged quests that don't always
+--                         appear in the quest log). Matched after normalizing.
+--
 -- Status per nation:
---   'Available'     - can be flagged this week
---   'Flagged'       - quest is currently active (quest log or has KI)
---   'Completed'     - completed this week
---   'Not Available' - another nation was flagged/completed this week, OR
---                     this nation was completed more recently than others
+--   'Available'        - can be flagged this week
+--   'Flagged'          - quest is currently active but KI not yet obtained
+--   'Need To Complete' - player has the KI, needs to complete and turn in
+--   'Completed'        - completed this week
+--   'Not Available'    - another nation was flagged/completed this week, OR
+--                        this nation was completed more recently than others
 --
 -- Stored per character in data[char].eco[nation_key] = {
 --   completed_week = "2026-W10" or nil  (the week key when last completed)
 --   stored_status  = "Available" etc.   (persisted for cross-char viewing)
+--   stored_flagged = true/nil           (set by flag_phrase, cleared on completion)
 -- }
 -- ============================================================================
 local ECO_WARRIORS = {
@@ -233,6 +246,7 @@ local ECO_WARRIORS = {
         quest_log_id        = 0,
         quest_id            = 97,
         ki_quest_incomplete = 'INDIGESTED_STALAGMITE',
+        flag_phrase         = '',  -- TODO: fill in the chat phrase when known
     },
     {
         nation              = 'Bastok',
@@ -240,6 +254,7 @@ local ECO_WARRIORS = {
         quest_log_id        = 1,
         quest_id            = 65,
         ki_quest_incomplete = 'INDIGESTED_ORE',
+        flag_phrase         = '',  -- TODO: fill in the chat phrase when known
     },
     {
         nation              = 'Windurst',
@@ -247,6 +262,7 @@ local ECO_WARRIORS = {
         quest_log_id        = 2,
         quest_id            = 84,
         ki_quest_incomplete = 'INDIGESTED_MEAT',
+        flag_phrase         = '',  -- TODO: fill in the chat phrase when known
     },
 }
 
@@ -671,7 +687,7 @@ local function check_packet_char_change()
     local name = get_current_char_name()
     if not name then return end
     if last_packet_char and last_packet_char ~= name then
-        log(string.format('Character change detected (%s -> %s) - clearing packet state.',
+        dlog(string.format('Character change detected (%s -> %s) - clearing packet state.',
             last_packet_char, name))
         clear_packet_state()
     end
@@ -886,6 +902,7 @@ local function process_ki_removals(table_index)
                             log(string.format('Eco Warrior KI removed: %s - marking %s as completed for %s.',
                                 ew.ki_quest_incomplete, ew.nation, week))
                             cd.eco[ew.key].completed_week = week
+                            cd.eco[ew.key].stored_flagged = nil
                             save_data()
                         end
                     end
@@ -923,14 +940,16 @@ end
 -- Returns a table: { [nation_key] = { status = '...', completed_week = '...' | nil } }
 --
 -- Logic:
---   1. If this nation is currently flagged (quest active or has KI) -> 'Flagged'
---   2. If this nation was completed THIS week -> 'Completed'
---   3. If another nation is flagged or completed this week -> 'Not Available'
---   4. Round-robin check: a nation is 'Available' only if all nations that were
+--   1. If this nation has the KI (ki_quest_incomplete) -> 'Need To Complete'
+--   2. If this nation is flagged (quest active, flag_phrase, or stored_flagged,
+--      but no KI yet) -> 'Flagged'
+--   3. If this nation was completed THIS week -> 'Completed'
+--   4. If another nation is flagged or completed this week -> 'Not Available'
+--   5. Round-robin check: a nation is 'Available' only if all nations that were
 --      completed MORE RECENTLY have been done. i.e. you must do each nation
 --      before repeating one. If this nation was completed more recently than
 --      at least one other nation, it's 'Not Available'.
---   5. Otherwise -> 'Available'
+--   6. Otherwise -> 'Available'
 --
 local function derive_eco_statuses(cd, is_current_char)
     local week = get_week_key()
@@ -938,21 +957,28 @@ local function derive_eco_statuses(cd, is_current_char)
     local any_flagged_this_week = false
     local any_completed_this_week = false
 
-    -- First pass: detect flagged and completed-this-week
+    -- First pass: detect flagged, has_ki, and completed-this-week
     for _, ew in ipairs(ECO_WARRIORS) do
         local eco_data = cd.eco and cd.eco[ew.key] or {}
         local flagged = false
+        local has_ki = false
+
+        -- Check stored_flagged (set by flag_phrase chat detection, persists across sessions)
+        if eco_data.stored_flagged then
+            flagged = true
+        end
 
         -- Live packet check for current char
         if is_current_char then
-            if ew.quest_log_id and ew.quest_id then
-                if is_quest_active(ew.quest_log_id, ew.quest_id) then
-                    flagged = true
-                end
-            end
             if ew.ki_quest_incomplete and ew.ki_quest_incomplete ~= '' then
                 local ki_id = resolve_ki_id(ew.ki_quest_incomplete)
                 if ki_id and has_key_item(ki_id) then
+                    has_ki = true
+                    flagged = true
+                end
+            end
+            if not has_ki and not flagged and ew.quest_log_id and ew.quest_id then
+                if is_quest_active(ew.quest_log_id, ew.quest_id) then
                     flagged = true
                 end
             end
@@ -962,6 +988,7 @@ local function derive_eco_statuses(cd, is_current_char)
 
         results[ew.key] = {
             flagged = flagged,
+            has_ki = has_ki,
             completed_this_week = completed_this_week,
             completed_week = eco_data.completed_week,
         }
@@ -977,7 +1004,9 @@ local function derive_eco_statuses(cd, is_current_char)
     for _, ew in ipairs(ECO_WARRIORS) do
         local r = results[ew.key]
 
-        if r.flagged then
+        if r.has_ki then
+            r.status = 'Need To Complete'
+        elseif r.flagged then
             r.status = 'Flagged'
         elseif r.completed_this_week then
             r.status = 'Completed'
@@ -1015,10 +1044,11 @@ local function derive_eco_statuses(cd, is_current_char)
 end
 
 local ECO_STATUS_COLORS = {
-    ['Available']     = { 0.0, 1.0, 0.4, 1.0 },    -- green
-    ['Flagged']       = { 1.0, 0.85, 0.0, 1.0 },    -- yellow
-    ['Completed']     = { 0.4, 0.8, 1.0, 1.0 },     -- light blue
-    ['Not Available'] = { 0.6, 0.6, 0.6, 1.0 },     -- grey
+    ['Available']        = { 0.0, 1.0, 0.4, 1.0 },    -- green
+    ['Flagged']          = { 1.0, 0.85, 0.0, 1.0 },    -- yellow
+    ['Need To Complete'] = { 1.0, 0.6, 0.0, 1.0 },     -- orange
+    ['Completed']        = { 0.4, 0.8, 1.0, 1.0 },     -- light blue
+    ['Not Available']    = { 0.6, 0.6, 0.6, 1.0 },     -- grey
 }
 
 -- ENM cooldown status helper
@@ -1766,6 +1796,27 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
             if string.find(msg, defeat_phrase, 1, true) then
                 pending_kills[qi] = now
                 log(string.format('Mob defeated: %s - waiting for XP confirm...', q.kill_mob))
+            end
+        end
+    end
+
+    -- ------------------------------------------------------------------
+    -- Eco Warrior flag_phrase detection
+    -- ------------------------------------------------------------------
+    for _, ew in ipairs(ECO_WARRIORS) do
+        if ew.flag_phrase and ew.flag_phrase ~= '' then
+            local phrase = normalize_string(ew.flag_phrase)
+            if phrase and string.find(msg, phrase, 1, true) then
+                local cd = ensure_char(name)
+                if cd then
+                    if not cd.eco then cd.eco = {} end
+                    if not cd.eco[ew.key] then cd.eco[ew.key] = {} end
+                    if not cd.eco[ew.key].stored_flagged then
+                        cd.eco[ew.key].stored_flagged = true
+                        log(string.format('Eco Warrior %s: flag phrase detected - marking as flagged.', ew.nation))
+                        save_data()
+                    end
+                end
             end
         end
     end
