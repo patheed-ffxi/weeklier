@@ -69,6 +69,9 @@ end
 --                       (e.g. bugged quests) but still have a chat message
 --                       when flagged. The phrase is matched after normalizing
 --                       (lowercase, stripped control chars).
+--                       Can be a single string or a table of strings to match
+--                       multiple phrases (e.g. different text for first-time
+--                       vs repeat completions).
 --
 -- Chat-based completion detection:
 --   complete_phrase   : if present, the addon will watch for this phrase in chat.
@@ -112,9 +115,8 @@ local QUESTS = {
     {
         name                = 'Secrets of Ovens Lost',
         -- quest is bugged and always shows as active
-        --quest_log_id        = 4,
-        --quest_id            = 73,
         ki_quest_incomplete = 'TAVNAZIAN_COOKBOOK',
+        flag_phrase = ''
     },
     {
         name                = 'Uninvited Guests',
@@ -224,6 +226,8 @@ local QUESTS = {
 --   flag_phrase         : chat phrase to detect quest being flagged (alternative to
 --                         quest_log_id/quest_id for bugged quests that don't always
 --                         appear in the quest log). Matched after normalizing.
+--                         Can be a single string or a table of strings to match
+--                         multiple phrases (e.g. first-time vs repeat text).
 --
 -- Status per nation:
 --   'Available'        - can be flagged this week
@@ -578,6 +582,33 @@ local function normalize_string(s)
     s = s:lower()
 
     return (s ~= '' and s or nil)
+end
+
+-- Check a flag_phrase value against a normalized message.
+-- flag_phrase can be a single string or a table of strings.
+-- Returns the matched phrase (original, unnormalized) or nil.
+local function match_flag_phrase(flag_phrase, normalized_msg)
+    if not flag_phrase then return nil end
+
+    local phrases
+    if type(flag_phrase) == 'string' then
+        if flag_phrase == '' then return nil end
+        phrases = { flag_phrase }
+    elseif type(flag_phrase) == 'table' then
+        phrases = flag_phrase
+    else
+        return nil
+    end
+
+    for _, fp in ipairs(phrases) do
+        if fp and fp ~= '' then
+            local norm = normalize_string(fp)
+            if norm and string.find(normalized_msg, norm, 1, true) then
+                return fp
+            end
+        end
+    end
+    return nil
 end
 
 -- ============================================================================
@@ -1751,11 +1782,11 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
         -- ==============================================================
         -- Flag phrase detection (chat-based alternative to quest_log_id)
         -- ==============================================================
-        if q.flag_phrase and q.flag_phrase ~= '' and q.type ~= 'enm' and q.type ~= 'kill_mob' then
-            local phrase = normalize_string(q.flag_phrase)
-            if phrase and string.find(msg, phrase, 1, true) then
+        if q.flag_phrase and q.type ~= 'enm' and q.type ~= 'kill_mob' then
+            local matched = match_flag_phrase(q.flag_phrase, msg)
+            if matched then
                 try_advance(name, q.name, 'NEED TO COMPLETE')
-                dlog(string.format('Flag phrase matched [%s]: "%s"', q.name, q.flag_phrase))
+                dlog(string.format('Flag phrase matched [%s]: "%s"', q.name, matched))
             end
         end
 
@@ -1804,16 +1835,16 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
     -- Eco Warrior flag_phrase detection
     -- ------------------------------------------------------------------
     for _, ew in ipairs(ECO_WARRIORS) do
-        if ew.flag_phrase and ew.flag_phrase ~= '' then
-            local phrase = normalize_string(ew.flag_phrase)
-            if phrase and string.find(msg, phrase, 1, true) then
+        if ew.flag_phrase then
+            local matched = match_flag_phrase(ew.flag_phrase, msg)
+            if matched then
                 local cd = ensure_char(name)
                 if cd then
                     if not cd.eco then cd.eco = {} end
                     if not cd.eco[ew.key] then cd.eco[ew.key] = {} end
                     if not cd.eco[ew.key].stored_flagged then
                         cd.eco[ew.key].stored_flagged = true
-                        log(string.format('Eco Warrior %s: flag phrase detected - marking as flagged.', ew.nation))
+                        log(string.format('Eco Warrior %s: flag phrase detected - marking as flagged. ("%s")', ew.nation, matched))
                         save_data()
                     end
                 end
