@@ -274,6 +274,31 @@ local ECO_WARRIORS = {
 }
 
 -- ============================================================================
+-- Dynamis Config
+-- ============================================================================
+-- Characters can enter Dynamis twice per week (same weekly reset).
+-- Tracked by detecting zone-in via packet 0x00A.
+-- Stored per character in data[char].dynamis = {
+--   { zone = "Dynamis - Xarcabard", zone_id = 135, time = <unix timestamp> },
+--   { zone = "Dynamis - Jeuno",     zone_id = 188, time = <unix timestamp> },
+-- }
+-- Max 2 entries per week. Reset on weekly rollover.
+local DYNAMIS_ZONES = {
+    [39]  = 'Dynamis - Valkurm',
+    [40]  = 'Dynamis - Buburimu',
+    [41]  = 'Dynamis - Qufim',
+    [42]  = 'Dynamis - Tavnazia',
+    [134] = 'Dynamis - Beaucedine',
+    [135] = 'Dynamis - Xarcabard',
+    [185] = "Dynamis - San d'Oria",
+    [186] = 'Dynamis - Bastok',
+    [187] = 'Dynamis - Windurst',
+    [188] = 'Dynamis - Jeuno'
+}
+
+local DYNAMIS_MAX_ENTRIES = 2
+
+-- ============================================================================
 -- State
 -- ============================================================================
 local save_path                             -- set in load_cb (addon.path available then)
@@ -654,6 +679,11 @@ local function ensure_char(name)
                 end
             end
         end
+        -- Reset dynamis entries for the new week
+        if data[name].dynamis and #data[name].dynamis > 0 then
+            log(string.format('  Reset Dynamis entries: %d -> 0', #data[name].dynamis))
+            data[name].dynamis = {}
+        end
     end
 
     -- Ensure every non-ENM quest from QUESTS list has an entry
@@ -687,6 +717,11 @@ local function ensure_char(name)
         if not data[name].eco[ew.key] then
             data[name].eco[ew.key] = {}  -- completed_week = nil initially
         end
+    end
+
+    -- Ensure dynamis tracking table exists
+    if not data[name].dynamis then
+        data[name].dynamis = {}
     end
 
     return data[name]
@@ -948,49 +983,6 @@ local function process_ki_removals(table_index)
 end
 
 -- ============================================================================
--- Background Status Update (runs from packet handlers, independent of UI)
--- ============================================================================
--- Derives statuses from live packet data and persists them for the current
--- character. This ensures log messages fire and JSON is saved immediately
--- when packet data changes, even if the UI is not open.
-local function update_current_char_statuses()
-    local name = get_current_char_name()
-    if not name then return end
-    local cd = ensure_char(name)
-    if not cd then return end
-
-    -- Derive and persist weekly quest statuses
-    for _, q in ipairs(QUESTS) do
-        if q.type ~= 'enm' and q.type ~= 'kill_mob' then
-            local stored_status = cd.quests[q.name] or 'NOT STARTED'
-            local status = derive_quest_status(q, stored_status)
-            if status ~= stored_status then
-                log(string.format('%s: %s -> %s', q.name, stored_status, status))
-                cd.quests[q.name] = status
-                save_data()
-            end
-        end
-    end
-
-    -- Derive and persist eco warrior statuses
-    local eco_statuses = derive_eco_statuses(cd, true)
-    local eco_changed = false
-    for _, ew in ipairs(ECO_WARRIORS) do
-        local r = eco_statuses[ew.key]
-        if not cd.eco[ew.key] then cd.eco[ew.key] = {} end
-        if cd.eco[ew.key].stored_status ~= r.status then
-            log(string.format('Eco %s: %s -> %s',
-                ew.nation,
-                cd.eco[ew.key].stored_status or 'nil',
-                r.status))
-            cd.eco[ew.key].stored_status = r.status
-            eco_changed = true
-        end
-    end
-    if eco_changed then save_data() end
-end
-
--- ============================================================================
 -- ImGui Rendering
 -- ============================================================================
 local STATUS_COLORS = {
@@ -1119,6 +1111,50 @@ local function derive_eco_statuses(cd, is_current_char)
     end
 
     return results
+end
+
+
+-- ============================================================================
+-- Background Status Update (runs from packet handlers, independent of UI)
+-- ============================================================================
+-- Derives statuses from live packet data and persists them for the current
+-- character. This ensures log messages fire and JSON is saved immediately
+-- when packet data changes, even if the UI is not open.
+local function update_current_char_statuses()
+    local name = get_current_char_name()
+    if not name then return end
+    local cd = ensure_char(name)
+    if not cd then return end
+
+    -- Derive and persist weekly quest statuses
+    for _, q in ipairs(QUESTS) do
+        if q.type ~= 'enm' and q.type ~= 'kill_mob' then
+            local stored_status = cd.quests[q.name] or 'NOT STARTED'
+            local status = derive_quest_status(q, stored_status)
+            if status ~= stored_status then
+                log(string.format('%s: %s -> %s', q.name, stored_status, status))
+                cd.quests[q.name] = status
+                save_data()
+            end
+        end
+    end
+
+    -- Derive and persist eco warrior statuses
+    local eco_statuses = derive_eco_statuses(cd, true)
+    local eco_changed = false
+    for _, ew in ipairs(ECO_WARRIORS) do
+        local r = eco_statuses[ew.key]
+        if not cd.eco[ew.key] then cd.eco[ew.key] = {} end
+        if cd.eco[ew.key].stored_status ~= r.status then
+            log(string.format('Eco %s: %s -> %s',
+                ew.nation,
+                cd.eco[ew.key].stored_status or 'nil',
+                r.status))
+            cd.eco[ew.key].stored_status = r.status
+            eco_changed = true
+        end
+    end
+    if eco_changed then save_data() end
 end
 
 local ECO_STATUS_COLORS = {
@@ -1448,6 +1484,71 @@ local function render_ui()
                         end
                     end
 
+                    -- ==================================================
+                    -- DYNAMIS SECTION (collapsible)
+                    -- ==================================================
+                    if not is_quest_hidden('Dynamis') then
+                        imgui.Spacing()
+                        if imgui.CollapsingHeader('Dynamis (2 per week)', ImGuiTreeNodeFlags_DefaultOpen) then
+                            local dyn = cd.dynamis or {}
+                            local used = #dyn
+
+                            imgui.Columns(4, '##dynCols', true)
+                            imgui.SetColumnWidth(0, 30)
+                            imgui.SetColumnWidth(1, 100)
+                            imgui.SetColumnWidth(2, 200)
+                            imgui.Text('')
+                            imgui.NextColumn()
+                            imgui.Text('Entrance')
+                            imgui.NextColumn()
+                            imgui.Text('Zone')
+                            imgui.NextColumn()
+                            imgui.Text('Date')
+                            imgui.NextColumn()
+                            imgui.Separator()
+
+                            for i = 1, DYNAMIS_MAX_ENTRIES do
+                                local entry = dyn[i]
+
+                                -- Hide button (only on first row)
+                                if i == 1 then
+                                    imgui.PushID('hide_dynamis')
+                                    if imgui.SmallButton('x') then
+                                        set_quest_hidden('Dynamis', true)
+                                        save_data()
+                                    end
+                                    imgui.PopID()
+                                else
+                                    imgui.Text('')
+                                end
+                                imgui.NextColumn()
+
+                                imgui.Text(string.format('Entrance %d', i))
+                                imgui.NextColumn()
+
+                                if entry then
+                                    imgui.Text(entry.zone or '??')
+                                    imgui.NextColumn()
+                                    imgui.Text(format_time(entry.time))
+                                else
+                                    imgui.TextColored(KI_COLOR_DIM, '-')
+                                    imgui.NextColumn()
+                                    imgui.TextColored(KI_COLOR_DIM, '-')
+                                end
+                                imgui.NextColumn()
+                            end
+
+                            -- Show remaining count
+                            local dyn_remaining = DYNAMIS_MAX_ENTRIES - used
+                            imgui.Columns(1)
+                            if dyn_remaining > 0 then
+                                imgui.TextColored(KI_COLOR_YES, string.format('%d entrance(s) remaining', dyn_remaining))
+                            else
+                                imgui.TextColored(STATUS_COLORS['COMPLETED'], 'All entrances used this week')
+                            end
+                        end
+                    end
+
                     imgui.EndTabItem()
                 end
             end
@@ -1510,6 +1611,19 @@ local function render_ui()
                         imgui.SameLine()
                         imgui.Text(string.format('[%s] %s', type_label, q.name))
                     end
+                end
+
+                -- Dynamis section
+                if is_quest_hidden('Dynamis') then
+                    any_hidden = true
+                    imgui.PushID('show_dynamis_section')
+                    if imgui.SmallButton('Show') then
+                        set_quest_hidden('Dynamis', false)
+                        save_data()
+                    end
+                    imgui.PopID()
+                    imgui.SameLine()
+                    imgui.Text('[Dynamis] Dynamis (entire section)')
                 end
 
                 if not any_hidden then
@@ -1646,8 +1760,9 @@ ashita.events.register('command', 'weeklier_command_cb', function(e)
                         end
                     end
                 end
+                cd.dynamis = {}
                 save_data()
-                log('Reset all quests for ' .. name)
+                log('Reset all quests and dynamis for ' .. name)
             end
         else
             log('Cannot determine current character.')
@@ -1679,6 +1794,12 @@ ashita.events.register('command', 'weeklier_command_cb', function(e)
                     local r = eco_statuses[ew.key]
                     local cw = r.completed_week or 'Never'
                     log(string.format('  [Eco] %s: %s (last=%s)', ew.nation, r.status, cw))
+                end
+                -- Dynamis
+                local dyn = cd.dynamis or {}
+                log(string.format('  [Dynamis] %d/%d entrances used', #dyn, DYNAMIS_MAX_ENTRIES))
+                for i, entry in ipairs(dyn) do
+                    log(string.format('    Entrance %d: %s (%s)', i, entry.zone, format_time(entry.time)))
                 end
             end
         else
@@ -1761,6 +1882,14 @@ ashita.events.register('command', 'weeklier_command_cb', function(e)
             log(string.format('  [ECO] %s: completed_week=%s quest_active=%s ki=%s(id=%s,has=%s)',
                 ew.nation, tostring(eco_data.completed_week), tostring(qa),
                 tostring(ew.ki_quest_incomplete), tostring(ki_id), tostring(has_ki)))
+        end
+
+        -- Dynamis diagnostics
+        local cd_dyn = data[char] and data[char].dynamis or {}
+        log(string.format('  [DYNAMIS] %d/%d entrances used', #cd_dyn, DYNAMIS_MAX_ENTRIES))
+        for i, entry in ipairs(cd_dyn) do
+            log(string.format('    %d: zone=%s (id=%d) time=%s',
+                i, entry.zone or '??', entry.zone_id or 0, format_time(entry.time)))
         end
 
         log('--- End Dump ---')
@@ -2062,6 +2191,45 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_056_active_quests', f
 
     -- Derive and persist statuses from updated packet data
     update_current_char_statuses()
+end)
+
+-- ============================================================================
+-- Zone-In Packet (0x00A) - Dynamis tracking
+-- ============================================================================
+-- Detects when the player zones into a Dynamis zone. Records the entry
+-- (up to DYNAMIS_MAX_ENTRIES per week) with zone name and timestamp.
+ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e)
+    if e.id ~= 0x00A then return end
+
+    local pkt = e.data
+    if not pkt or #pkt < 0x34 then return end
+
+    -- Zone ID at offset 0x30 (uint32 LE) -> 1-based offset 0x31
+    local zone_id = u32le(pkt, 0x30 + 1)
+    local zone_name = DYNAMIS_ZONES[zone_id]
+    if not zone_name then return end
+
+    local name = get_current_char_name()
+    if not name then return end
+
+    local cd = ensure_char(name)
+    if not cd then return end
+
+    local used = #cd.dynamis
+    if used >= DYNAMIS_MAX_ENTRIES then
+        dlog(string.format('Dynamis zone-in %s (id=%d) but already at max entries (%d).',
+            zone_name, zone_id, DYNAMIS_MAX_ENTRIES))
+        return
+    end
+
+    local entry = {
+        zone    = zone_name,
+        zone_id = zone_id,
+        time    = os.time(),
+    }
+    cd.dynamis[#cd.dynamis + 1] = entry
+    log(string.format('Dynamis entrance %d/%d: %s', #cd.dynamis, DYNAMIS_MAX_ENTRIES, zone_name))
+    save_data()
 end)
 
 -- ============================================================================
