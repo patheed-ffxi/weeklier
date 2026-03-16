@@ -948,6 +948,49 @@ local function process_ki_removals(table_index)
 end
 
 -- ============================================================================
+-- Background Status Update (runs from packet handlers, independent of UI)
+-- ============================================================================
+-- Derives statuses from live packet data and persists them for the current
+-- character. This ensures log messages fire and JSON is saved immediately
+-- when packet data changes, even if the UI is not open.
+local function update_current_char_statuses()
+    local name = get_current_char_name()
+    if not name then return end
+    local cd = ensure_char(name)
+    if not cd then return end
+
+    -- Derive and persist weekly quest statuses
+    for _, q in ipairs(QUESTS) do
+        if q.type ~= 'enm' and q.type ~= 'kill_mob' then
+            local stored_status = cd.quests[q.name] or 'NOT STARTED'
+            local status = derive_quest_status(q, stored_status)
+            if status ~= stored_status then
+                log(string.format('%s: %s -> %s', q.name, stored_status, status))
+                cd.quests[q.name] = status
+                save_data()
+            end
+        end
+    end
+
+    -- Derive and persist eco warrior statuses
+    local eco_statuses = derive_eco_statuses(cd, true)
+    local eco_changed = false
+    for _, ew in ipairs(ECO_WARRIORS) do
+        local r = eco_statuses[ew.key]
+        if not cd.eco[ew.key] then cd.eco[ew.key] = {} end
+        if cd.eco[ew.key].stored_status ~= r.status then
+            log(string.format('Eco %s: %s -> %s',
+                ew.nation,
+                cd.eco[ew.key].stored_status or 'nil',
+                r.status))
+            cd.eco[ew.key].stored_status = r.status
+            eco_changed = true
+        end
+    end
+    if eco_changed then save_data() end
+end
+
+-- ============================================================================
 -- ImGui Rendering
 -- ============================================================================
 local STATUS_COLORS = {
@@ -1200,13 +1243,13 @@ local function render_ui()
                                 local stored_status = cd.quests[q.name] or 'NOT STARTED'
                                 local status
 
-                                -- For the current character, derive status from live packet data
-                                -- and persist it. For other characters, use stored status.
+                                -- For the current character, derive status from live packet data.
+                                -- Logging and persistence is handled by update_current_char_statuses()
+                                -- which runs from packet handlers.
                                 if is_current_tab and q.type ~= 'kill_mob' then
                                     status = derive_quest_status(q, stored_status)
-                                    -- Persist derived status so it's visible on other chars
+                                    -- Persist silently (no log) in case UI opens before a packet triggers the update
                                     if status ~= stored_status then
-                                        log(string.format('%s: %s -> %s', q.name, stored_status, status))
                                         cd.quests[q.name] = status
                                         save_data()
                                     end
@@ -1243,17 +1286,14 @@ local function render_ui()
                         if imgui.CollapsingHeader('Eco Warriors', ImGuiTreeNodeFlags_DefaultOpen) then
                             local eco_statuses = derive_eco_statuses(cd, is_current_tab)
 
-                            -- Persist eco status for current char so it's viewable on other chars
+                            -- Persist eco status for current char (no log - handled by
+                            -- update_current_char_statuses() from packet handlers)
                             if is_current_tab then
                                 local eco_changed = false
                                 for _, ew in ipairs(ECO_WARRIORS) do
                                     local r = eco_statuses[ew.key]
                                     if not cd.eco[ew.key] then cd.eco[ew.key] = {} end
                                     if cd.eco[ew.key].stored_status ~= r.status then
-                                        log(string.format('Eco %s: %s -> %s',
-                                            ew.nation,
-                                            cd.eco[ew.key].stored_status or 'nil',
-                                            r.status))
                                         cd.eco[ew.key].stored_status = r.status
                                         eco_changed = true
                                     end
@@ -1974,6 +2014,9 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb', function(e)
     if prev_ki_bitmap[table_index] then
         process_ki_removals(table_index)
     end
+
+    -- Derive and persist statuses from updated packet data
+    update_current_char_statuses()
 end)
 
 ashita.events.register('packet_in', 'weeklier_packet_in_cb_056_active_quests', function(e)
@@ -2016,6 +2059,9 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_056_active_quests', f
             end
         end
     end
+
+    -- Derive and persist statuses from updated packet data
+    update_current_char_statuses()
 end)
 
 -- ============================================================================
