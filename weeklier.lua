@@ -278,6 +278,7 @@ local ECO_WARRIORS = {
 -- ============================================================================
 local save_path                             -- set in load_cb (addon.path available then)
 local show_window = { false }               -- imgui bool wrapper
+local select_current_tab = false            -- when true, auto-select current char tab on next frame
 local data = {}                             -- { [char_name] = { week, quests, enms, eco }, _hidden = { [name] = true } }
 local current_char                          -- detected from party info
 local last_packet_char                      -- tracks which char the packet-derived bitmaps belong to
@@ -1170,7 +1171,12 @@ local function render_ui()
             -- ==========================================================
             for _, char_name in ipairs(char_names) do
                 local cd = data[char_name]
-                if cd and imgui.BeginTabItem(char_name) then
+                local tab_flags = 0
+                if select_current_tab and char_name == current_char then
+                    tab_flags = ImGuiTabItemFlags_SetSelected
+                    select_current_tab = false
+                end
+                if cd and imgui.BeginTabItem(char_name, nil, tab_flags) then
                     local is_current_tab = (char_name == current_char)
 
                     -- ==================================================
@@ -1574,6 +1580,9 @@ ashita.events.register('command', 'weeklier_command_cb', function(e)
 
     if sub == 'show' or sub == 'toggle' then
         show_window[1] = not show_window[1]
+        if show_window[1] then
+            select_current_tab = true
+        end
         return
     end
 
