@@ -3,8 +3,8 @@ local bit = require('bit')
 local imgui = require('imgui')
 
 addon.name    = 'weeklier'
-addon.author  = 'custom'
-addon.version = '0.1a'
+addon.author  = 'Pathead'
+addon.version = '0.2a'
 addon.desc    = 'Tracks weekly quest completion across characters.'
 addon.link    = ''
 
