@@ -318,6 +318,7 @@ local select_current_tab = false            -- when true, auto-select current ch
 local data = {}                             -- { [char_name] = { week, quests, enms, eco }, _hidden = { [name] = true } }
 local current_char                          -- detected from party info
 local last_packet_char                      -- tracks which char the packet-derived bitmaps belong to
+local override_selected_char = nil          -- selected character for manual status override in Config tab
 
 -- Hidden quests (global UI preference, not per-character).
 -- Stored as data._hidden = { [quest_name] = true, ... }
@@ -1653,71 +1654,264 @@ local function render_ui()
                     imgui.TextColored({ 0.5, 0.5, 0.5, 1.0 }, 'No hidden quests.')
                 end
 
+
                 -- ----------------------------------------------------------
-                -- Eco Warrior Manual Override
+                -- Manual Status Override (All Quests & Dynamis)
                 -- ----------------------------------------------------------
                 imgui.Spacing()
                 imgui.Spacing()
-                imgui.TextColored({ 1.0, 0.6, 0.4, 1.0 }, 'Eco Warrior - Manual Override')
+                imgui.TextColored({ 1.0, 0.6, 0.4, 1.0 }, 'Manual Status Override')
                 imgui.Separator()
-                imgui.TextWrapped('Mark a nation as completed for a specific week to bootstrap the round-robin cycle. Select the character, then click a button to mark that nation as completed for the current week (or click Clear to remove the completion record).')
+                imgui.TextWrapped('Manually set the status for any quest, ENM, or Dynamis entry. Select a character, then change values. For the current character, live packet data may re-derive some statuses automatically.')
                 imgui.Spacing()
 
-                -- Character selector for eco override
-                local char_names_eco = {}
+                -- Build character list
+                local override_chars = {}
                 for cname, cdata in pairs(data) do
-                    if cname ~= '_hidden' and type(cdata) == 'table' and cdata.quests then
-                        char_names_eco[#char_names_eco + 1] = cname
+                    if cname ~= '_hidden' and type(cdata) == 'table' then
+                        override_chars[#override_chars + 1] = cname
                     end
                 end
-                table.sort(char_names_eco)
+                table.sort(override_chars)
 
-                for _, cname in ipairs(char_names_eco) do
-                    local cd = data[cname]
-                    if cd then
-                        imgui.Text(cname .. ':')
-                        imgui.SameLine()
-                        for _, ew in ipairs(ECO_WARRIORS) do
-                            local eco_data = cd.eco and cd.eco[ew.key] or {}
-                            local cw = eco_data.completed_week
-                            local week = get_week_key()
+                -- Character selector
+                imgui.Text('Character:')
+                for _, cname in ipairs(override_chars) do
+                    imgui.SameLine()
+                    imgui.PushID('ovrsel_' .. cname)
+                    if cname == override_selected_char then
+                        imgui.TextColored({ 0.0, 1.0, 0.4, 1.0 }, '> ' .. cname)
+                    else
+                        if imgui.SmallButton(cname) then
+                            override_selected_char = cname
+                        end
+                    end
+                    imgui.PopID()
+                end
 
-                            imgui.PushID('eco_override_' .. cname .. '_' .. ew.key)
-                            if cw == week then
-                                -- Already marked this week - show clear button
-                                imgui.TextColored(ECO_STATUS_COLORS['Completed'], ew.nation)
-                                imgui.SameLine()
-                                if imgui.SmallButton('Clear') then
-                                    cd.eco[ew.key].completed_week = nil
-                                    save_data()
-                                    log(string.format('Eco override: cleared %s for %s', ew.nation, cname))
-                                end
-                            else
-                                -- Show mark button
-                                if imgui.SmallButton(ew.nation) then
-                                    if not cd.eco then cd.eco = {} end
-                                    if not cd.eco[ew.key] then cd.eco[ew.key] = {} end
-                                    cd.eco[ew.key].completed_week = week
-                                    save_data()
-                                    log(string.format('Eco override: marked %s as completed %s for %s',
-                                        ew.nation, week, cname))
+                if override_selected_char and data[override_selected_char] then
+                    local ocd = ensure_char(override_selected_char)
+                    if ocd then
+
+                        -- ---- Weekly Quests & Kill Quests ----
+                        imgui.Spacing()
+                        if imgui.CollapsingHeader('Override: Weekly Quests##ovr_wq') then
+                            for _, q in ipairs(QUESTS) do
+                                if q.type ~= 'enm' then
+                                    local cur = ocd.quests[q.name] or 'NOT STARTED'
+                                    local valid_statuses
+                                    if q.type == 'kill_mob' then
+                                        valid_statuses = { 'NEED TO COMPLETE', 'COMPLETED' }
+                                    else
+                                        valid_statuses = { 'NOT STARTED', 'NEED TO COMPLETE', 'READY TO TURN IN', 'COMPLETED' }
+                                    end
+
+                                    local color = STATUS_COLORS[cur] or STATUS_COLORS['NOT STARTED']
+                                    imgui.Text(q.name .. ':')
+                                    imgui.SameLine()
+                                    imgui.TextColored(color, cur)
+                                    for _, s in ipairs(valid_statuses) do
+                                        if s ~= cur then
+                                            imgui.SameLine()
+                                            imgui.PushID('ovr_wq_' .. q.name .. '_' .. s)
+                                            if imgui.SmallButton(s) then
+                                                ocd.quests[q.name] = s
+                                                log(string.format('Manual override: %s [%s] %s -> %s',
+                                                    q.name, override_selected_char, cur, s))
+                                                save_data()
+                                            end
+                                            imgui.PopID()
+                                        end
+                                    end
                                 end
                             end
-                            imgui.PopID()
-                            imgui.SameLine()
                         end
-                        -- Show current completed weeks
-                        imgui.Text('')  -- newline after SameLine chain
-                        imgui.SameLine()
-                        local parts = {}
-                        for _, ew in ipairs(ECO_WARRIORS) do
-                            local eco_data = cd.eco and cd.eco[ew.key] or {}
-                            local cw = eco_data.completed_week or 'Never'
-                            parts[#parts + 1] = string.format('%s=%s', ew.key, cw)
+
+                        -- ---- ENMs ----
+                        imgui.Spacing()
+                        if imgui.CollapsingHeader('Override: ENMs##ovr_enm') then
+                            for _, q in ipairs(QUESTS) do
+                                if q.type == 'enm' then
+                                    if not ocd.enms then ocd.enms = {} end
+                                    if not ocd.enms[q.name] then ocd.enms[q.name] = {} end
+                                    local enm = ocd.enms[q.name]
+
+                                    local ki_str = enm.has_ki and 'Yes' or 'No'
+                                    local obt_str = enm.ki_obtained_time and format_time(enm.ki_obtained_time) or 'Never'
+                                    local _, _, ready_str = get_enm_status(enm, q)
+
+                                    imgui.Text(string.format('%s  KI:%s  CD:%s  Ready:%s',
+                                        q.name, ki_str, obt_str, ready_str))
+                                    imgui.SameLine()
+
+                                    imgui.PushID('ovr_enm_ki_' .. q.name)
+                                    if imgui.SmallButton(enm.has_ki and 'Remove KI' or 'Give KI') then
+                                        enm.has_ki = not enm.has_ki
+                                        log(string.format('Manual override: %s [%s] has_ki -> %s',
+                                            q.name, override_selected_char, tostring(enm.has_ki)))
+                                        save_data()
+                                    end
+                                    imgui.PopID()
+                                    imgui.SameLine()
+
+                                    imgui.PushID('ovr_enm_cdn_' .. q.name)
+                                    if imgui.SmallButton('Start CD') then
+                                        enm.ki_obtained_time = os.time()
+                                        log(string.format('Manual override: %s [%s] cooldown started now',
+                                            q.name, override_selected_char))
+                                        save_data()
+                                    end
+                                    imgui.PopID()
+                                    imgui.SameLine()
+
+                                    imgui.PushID('ovr_enm_cdc_' .. q.name)
+                                    if imgui.SmallButton('Clear CD') then
+                                        enm.ki_obtained_time = nil
+                                        log(string.format('Manual override: %s [%s] cooldown cleared',
+                                            q.name, override_selected_char))
+                                        save_data()
+                                    end
+                                    imgui.PopID()
+                                end
+                            end
                         end
-                        imgui.TextColored(KI_COLOR_DIM, '  (' .. table.concat(parts, ', ') .. ')')
-                    end
-                end
+
+                        -- ---- Eco Warriors ----
+                        imgui.Spacing()
+                        if imgui.CollapsingHeader('Override: Eco Warriors##ovr_eco') then
+                            local ovr_week = get_week_key()
+                            for _, ew in ipairs(ECO_WARRIORS) do
+                                if not ocd.eco then ocd.eco = {} end
+                                if not ocd.eco[ew.key] then ocd.eco[ew.key] = {} end
+                                local eco = ocd.eco[ew.key]
+
+                                local cw = eco.completed_week or 'Never'
+                                local flags = {}
+                                if eco.stored_flagged then flags[#flags + 1] = 'Flagged' end
+                                if eco.stored_verified then flags[#flags + 1] = 'Verified' end
+                                local flag_str = #flags > 0 and table.concat(flags, ', ') or 'None'
+
+                                imgui.Text(string.format('%s  Last:%s  Flags:%s', ew.nation, cw, flag_str))
+                                imgui.SameLine()
+
+                                imgui.PushID('ovr_eco_f_' .. ew.key)
+                                if imgui.SmallButton(eco.stored_flagged and 'Unflag' or 'Flag') then
+                                    if eco.stored_flagged then
+                                        eco.stored_flagged = nil
+                                    else
+                                        eco.stored_flagged = true
+                                    end
+                                    log(string.format('Manual override: Eco %s [%s] flagged -> %s',
+                                        ew.nation, override_selected_char, tostring(eco.stored_flagged)))
+                                    save_data()
+                                end
+                                imgui.PopID()
+                                imgui.SameLine()
+
+                                imgui.PushID('ovr_eco_v_' .. ew.key)
+                                if imgui.SmallButton(eco.stored_verified and 'Unverify' or 'Verify') then
+                                    if eco.stored_verified then
+                                        eco.stored_verified = nil
+                                    else
+                                        eco.stored_verified = true
+                                    end
+                                    log(string.format('Manual override: Eco %s [%s] verified -> %s',
+                                        ew.nation, override_selected_char, tostring(eco.stored_verified)))
+                                    save_data()
+                                end
+                                imgui.PopID()
+                                imgui.SameLine()
+
+                                imgui.PushID('ovr_eco_c_' .. ew.key)
+                                if eco.completed_week == ovr_week then
+                                    if imgui.SmallButton('Clear Cmpl') then
+                                        eco.completed_week = nil
+                                        eco.stored_flagged = nil
+                                        eco.stored_verified = nil
+                                        log(string.format('Manual override: Eco %s [%s] completion cleared',
+                                            ew.nation, override_selected_char))
+                                        save_data()
+                                    end
+                                else
+                                    if imgui.SmallButton('Mark Cmpl') then
+                                        eco.completed_week = ovr_week
+                                        eco.stored_flagged = nil
+                                        eco.stored_verified = nil
+                                        log(string.format('Manual override: Eco %s [%s] completed %s',
+                                            ew.nation, override_selected_char, ovr_week))
+                                        save_data()
+                                    end
+                                end
+                                imgui.PopID()
+                            end
+                        end
+
+                        -- ---- Dynamis ----
+                        imgui.Spacing()
+                        if imgui.CollapsingHeader('Override: Dynamis##ovr_dyn') then
+                            if not ocd.dynamis then ocd.dynamis = {} end
+                            local dyn = ocd.dynamis
+                            local used = #dyn
+
+                            local remove_idx = nil
+                            for i, entry in ipairs(dyn) do
+                                imgui.Text(string.format('  Entrance %d: %s (%s)',
+                                    i, entry.zone or '??', format_time(entry.time)))
+                                imgui.SameLine()
+                                imgui.PushID('ovr_dyn_rm_' .. i)
+                                if imgui.SmallButton('Remove') then
+                                    remove_idx = i
+                                end
+                                imgui.PopID()
+                            end
+                            if remove_idx then
+                                local removed = dyn[remove_idx]
+                                table.remove(ocd.dynamis, remove_idx)
+                                log(string.format('Manual override: removed Dynamis entry %d (%s) [%s]',
+                                    remove_idx, removed and removed.zone or '??', override_selected_char))
+                                save_data()
+                            end
+
+                            if used == 0 then
+                                imgui.TextColored(KI_COLOR_DIM, '  No entries this week.')
+                            end
+
+                            if used < DYNAMIS_MAX_ENTRIES then
+                                imgui.Text('  Add:')
+                                local zone_ids_sorted = {}
+                                for zid, _ in pairs(DYNAMIS_ZONES) do
+                                    zone_ids_sorted[#zone_ids_sorted + 1] = zid
+                                end
+                                table.sort(zone_ids_sorted)
+                                local btn_count = 0
+                                for _, zid in ipairs(zone_ids_sorted) do
+                                    local zname = DYNAMIS_ZONES[zid]
+                                    local short = zname:gsub('Dynamis %- ', '')
+                                    if btn_count > 0 and btn_count % 5 ~= 0 then
+                                        imgui.SameLine()
+                                    end
+                                    imgui.PushID('ovr_dyn_add_' .. zid)
+                                    if imgui.SmallButton(short) then
+                                        ocd.dynamis[#ocd.dynamis + 1] = {
+                                            zone = zname,
+                                            zone_id = zid,
+                                            time = os.time(),
+                                        }
+                                        log(string.format('Manual override: added Dynamis %s [%s]',
+                                            zname, override_selected_char))
+                                        save_data()
+                                    end
+                                    imgui.PopID()
+                                    btn_count = btn_count + 1
+                                end
+                            else
+                                imgui.TextColored(KI_COLOR_DIM,
+                                    string.format('  All %d entrances used.', DYNAMIS_MAX_ENTRIES))
+                            end
+                        end
+
+                    end -- if ocd
+                end -- if override_selected_char
 
                 imgui.EndTabItem()
             end
