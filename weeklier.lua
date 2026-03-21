@@ -231,19 +231,27 @@ local QUESTS = {
 --                         appear in the quest log). Matched after normalizing.
 --                         Can be a single string or a table of strings to match
 --                         multiple phrases (e.g. first-time vs repeat text).
+--   verify_phrase       : chat phrase to detect the in-zone verification step.
+--                         After obtaining the KI, the player must talk to an NPC in
+--                         the zone to verify it before returning to the quest giver.
+--                         When detected, status changes from 'Return to NPC' to
+--                         'Need To Complete'. Matched after normalizing.
+--                         Can be a single string or a table of strings.
 --
 -- Status per nation:
 --   'Available'        - can be flagged this week
 --   'Flagged'          - quest is currently active but KI not yet obtained
---   'Need To Complete' - player has the KI, needs to complete and turn in
+--   'Return to NPC'    - player has the KI but hasn't verified it in the zone yet
+--   'Need To Complete' - player has verified the KI, needs to return to quest giver
 --   'Completed'        - completed this week
 --   'Not Available'    - another nation was flagged/completed this week, OR
 --                        this nation was completed more recently than others
 --
 -- Stored per character in data[char].eco[nation_key] = {
---   completed_week = "2026-W10" or nil  (the week key when last completed)
---   stored_status  = "Available" etc.   (persisted for cross-char viewing)
---   stored_flagged = true/nil           (set by flag_phrase, cleared on completion)
+--   completed_week  = "2026-W10" or nil  (the week key when last completed)
+--   stored_status   = "Available" etc.   (persisted for cross-char viewing)
+--   stored_flagged  = true/nil           (set by flag_phrase, cleared on completion)
+--   stored_verified = true/nil           (set by verify_phrase, cleared on completion)
 -- }
 -- ============================================================================
 local ECO_WARRIORS = {
@@ -253,7 +261,8 @@ local ECO_WARRIORS = {
         quest_log_id        = 0,
         quest_id            = 97,
         ki_quest_incomplete = 'INDIGESTED_STALAGMITE',
-        flag_phrase         = 'Rojaireaut, our V.E.R.M.I.N. agent in the field, will be waiting for you in the caves'
+        flag_phrase         = 'Rojaireaut, our V.E.R.M.I.N. agent in the field, will be waiting for you in the caves',
+        verify_phrase       = "What's that you have there? An indigested stalagmite from the fiend",
     },
     {
         nation              = 'Bastok',
@@ -261,7 +270,8 @@ local ECO_WARRIORS = {
         quest_log_id        = 1,
         quest_id            = 65,
         ki_quest_incomplete = 'INDIGESTED_ORE',
-        flag_phrase         = 'Degga, one of our V.E.R.M.I.N. field agents, will give you further instructions'
+        flag_phrase         = 'Degga, one of our V.E.R.M.I.N. field agents, will give you further instructions',
+        verify_phrase       = 'Lemme see that... Huh, an indigested ore. Take it on back to Raifa',
     },
     {
         nation              = 'Windurst',
@@ -269,7 +279,8 @@ local ECO_WARRIORS = {
         quest_log_id        = 2,
         quest_id            = 84,
         ki_quest_incomplete = 'INDIGESTED_MEAT',
-        flag_phrase         = 'Our V.E.R.M.I.N. field agent, Ahko Mhalijikhari, will be waiting in the maze'
+        flag_phrase         = 'Our V.E.R.M.I.N. field agent, Ahko Mhalijikhari, will be waiting in the maze',
+        verify_phrase       = 'How...lovely. A chunk of indigested meat',
     },
 }
 
@@ -973,6 +984,7 @@ local function process_ki_removals(table_index)
                                 ew.ki_quest_incomplete, ew.nation, week))
                             cd.eco[ew.key].completed_week = week
                             cd.eco[ew.key].stored_flagged = nil
+                            cd.eco[ew.key].stored_verified = nil
                             save_data()
                         end
                     end
@@ -1010,16 +1022,17 @@ end
 -- Returns a table: { [nation_key] = { status = '...', completed_week = '...' | nil } }
 --
 -- Logic:
---   1. If this nation has the KI (ki_quest_incomplete) -> 'Need To Complete'
---   2. If this nation is flagged (quest active, flag_phrase, or stored_flagged,
+--   1. If this nation has the KI (ki_quest_incomplete) and verified -> 'Need To Complete'
+--   2. If this nation has the KI but not verified -> 'Return to NPC'
+--   3. If this nation is flagged (quest active, flag_phrase, or stored_flagged,
 --      but no KI yet) -> 'Flagged'
---   3. If this nation was completed THIS week -> 'Completed'
---   4. If another nation is flagged or completed this week -> 'Not Available'
---   5. Round-robin check: a nation is 'Available' only if all nations that were
+--   4. If this nation was completed THIS week -> 'Completed'
+--   5. If another nation is flagged or completed this week -> 'Not Available'
+--   6. Round-robin check: a nation is 'Available' only if all nations that were
 --      completed MORE RECENTLY have been done. i.e. you must do each nation
 --      before repeating one. If this nation was completed more recently than
 --      at least one other nation, it's 'Not Available'.
---   6. Otherwise -> 'Available'
+--   7. Otherwise -> 'Available'
 --
 local function derive_eco_statuses(cd, is_current_char)
     local week = get_week_key()
@@ -1027,15 +1040,21 @@ local function derive_eco_statuses(cd, is_current_char)
     local any_flagged_this_week = false
     local any_completed_this_week = false
 
-    -- First pass: detect flagged, has_ki, and completed-this-week
+    -- First pass: detect flagged, has_ki, verified, and completed-this-week
     for _, ew in ipairs(ECO_WARRIORS) do
         local eco_data = cd.eco and cd.eco[ew.key] or {}
         local flagged = false
         local has_ki = false
+        local verified = false
 
         -- Check stored_flagged (set by flag_phrase chat detection, persists across sessions)
         if eco_data.stored_flagged then
             flagged = true
+        end
+
+        -- Check stored_verified (set by verify_phrase chat detection, persists across sessions)
+        if eco_data.stored_verified then
+            verified = true
         end
 
         -- Live packet check for current char
@@ -1059,6 +1078,7 @@ local function derive_eco_statuses(cd, is_current_char)
         results[ew.key] = {
             flagged = flagged,
             has_ki = has_ki,
+            verified = verified,
             completed_this_week = completed_this_week,
             completed_week = eco_data.completed_week,
         }
@@ -1074,8 +1094,10 @@ local function derive_eco_statuses(cd, is_current_char)
     for _, ew in ipairs(ECO_WARRIORS) do
         local r = results[ew.key]
 
-        if r.has_ki then
+        if r.has_ki and r.verified then
             r.status = 'Need To Complete'
+        elseif r.has_ki then
+            r.status = 'Return to NPC'
         elseif r.flagged then
             r.status = 'Flagged'
         elseif r.completed_this_week then
@@ -1160,6 +1182,7 @@ end
 local ECO_STATUS_COLORS = {
     ['Available']        = { 0.0, 1.0, 0.4, 1.0 },    -- green
     ['Flagged']          = { 1.0, 0.85, 0.0, 1.0 },    -- yellow
+    ['Return to NPC']    = { 1.0, 0.5, 0.0, 1.0 },     -- orange-red (in-zone verify needed)
     ['Need To Complete'] = { 1.0, 0.6, 0.0, 1.0 },     -- orange
     ['Completed']        = { 0.4, 0.8, 1.0, 1.0 },     -- light blue
     ['Not Available']    = { 0.6, 0.6, 0.6, 1.0 },     -- grey
@@ -2026,6 +2049,27 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
                     if not cd.eco[ew.key].stored_flagged then
                         cd.eco[ew.key].stored_flagged = true
                         log(string.format('Eco Warrior %s: flag phrase detected - marking as flagged. ("%s")', ew.nation, matched))
+                        save_data()
+                    end
+                end
+            end
+        end
+    end
+
+    -- ------------------------------------------------------------------
+    -- Eco Warrior verify_phrase detection
+    -- ------------------------------------------------------------------
+    for _, ew in ipairs(ECO_WARRIORS) do
+        if ew.verify_phrase then
+            local matched = match_flag_phrase(ew.verify_phrase, msg)
+            if matched then
+                local cd = ensure_char(name)
+                if cd then
+                    if not cd.eco then cd.eco = {} end
+                    if not cd.eco[ew.key] then cd.eco[ew.key] = {} end
+                    if not cd.eco[ew.key].stored_verified then
+                        cd.eco[ew.key].stored_verified = true
+                        log(string.format('Eco Warrior %s: verify phrase detected - marking as verified. ("%s")', ew.nation, matched))
                         save_data()
                     end
                 end
