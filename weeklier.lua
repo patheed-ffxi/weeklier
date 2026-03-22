@@ -288,7 +288,10 @@ local ECO_WARRIORS = {
 -- Dynamis Config
 -- ============================================================================
 -- Characters can enter Dynamis twice per week (same weekly reset).
--- Tracked by detecting zone-in via packet 0x00A.
+-- Tracked by detecting zone-in via packet 0x00A. Active session time is
+-- tracked via system chat messages ("expelled from Dynamis in X minutes"
+-- and "stay in Dynamis has been extended by X minutes") so that leaving
+-- and re-entering the same zone does not count as a second weekly entry.
 -- Stored per character in data[char].dynamis = {
 --   { zone = "Dynamis - Xarcabard", zone_id = 135, time = <unix timestamp> },
 --   { zone = "Dynamis - Jeuno",     zone_id = 188, time = <unix timestamp> },
@@ -318,6 +321,19 @@ local select_current_tab = false            -- when true, auto-select current ch
 local data = {}                             -- { [char_name] = { week, quests, enms, eco }, _hidden = { [name] = true } }
 local current_char                          -- detected from party info
 local last_packet_char                      -- tracks which char the packet-derived bitmaps belong to
+
+-- Active Dynamis session tracking.
+-- When the player is inside a Dynamis zone, this holds the session details
+-- so that zoning out and back in doesn't count as a second weekly entry.
+-- Session time is derived from system chat messages:
+--   "You will be expelled from Dynamis in X minutes (Earth time)." -> sets expiry
+--   "Your stay in Dynamis has been extended by X minutes."         -> extends expiry
+-- Fields:
+--   zone_id     : the Dynamis zone ID the player entered
+--   zone_name   : human-readable zone name
+--   expiry_time : UTC unix timestamp when the Dynamis timer runs out
+--   last_update : os.time() when we last updated this session
+local dynamis_active_session = nil
 local override_selected_char = nil          -- selected character for manual status override in Config tab
 
 -- Hidden quests (global UI preference, not per-character).
@@ -423,6 +439,12 @@ local function read_u32x8(pkt)
         t[i] = u32le(pkt, 0x04 + 1 + (i * 4))
     end
     return t
+end
+
+-- Returns true if there is an active Dynamis session that has not yet expired.
+local function is_dynamis_session_active()
+    if not dynamis_active_session then return false end
+    return dynamis_active_session.expiry_time > os.time()
 end
 
 -- Check whether the player currently holds a key item by numeric ID.
@@ -751,15 +773,16 @@ end
 -- Declared here (before clear_packet_state) so it can be cleared on character change.
 local last_derived_status = {}
 
--- Clear all packet-derived state (KI bitmaps, quest blocks, derived status cache).
--- Must be called whenever the logged-in character changes so that stale data from
--- the previous character is not mistakenly compared against the new character's
--- incoming packets (which would cause false KI "removal" detections).
+-- Clear all packet-derived state (KI bitmaps, quest blocks, derived status cache,
+-- active Dynamis session). Must be called whenever the logged-in character changes
+-- so that stale data from the previous character is not mistakenly compared against
+-- the new character's incoming packets (which would cause false KI "removal" detections).
 local function clear_packet_state()
     ki_bitmap = {}
     prev_ki_bitmap = {}
     active_quest_blocks = {}
     last_derived_status = {}
+    dynamis_active_session = nil
     dlog('Cleared packet-derived state (character change).')
 end
 
@@ -2120,8 +2143,72 @@ end)
 -- Chat Monitoring
 -- ============================================================================
 ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
-    if e.injected then return end
     if not e.message or e.message == '' then return end
+
+    -- ------------------------------------------------------------------
+    -- Dynamis session time tracking (chat-based)
+    -- ------------------------------------------------------------------
+    -- These are injected system messages, so they must be processed BEFORE
+    -- the e.injected early-return below.
+    --
+    -- "You will be expelled from Dynamis in X minute(s) (Earth time)." -> set expiry
+    -- "Your stay in Dynamis has been extended by X minutes."           -> extend expiry
+    local dyn_msg = normalize_string(e.message)
+    if dyn_msg then
+        -- Expulsion warning (singular and plural)
+        local expel_minutes = string.match(dyn_msg, 'you will be expelled from dynamis in (%d+) minutes?')
+        if expel_minutes then
+            local minutes = tonumber(expel_minutes)
+            if minutes and minutes > 0 then
+                local now_ts = os.time()
+                local expiry = now_ts + (minutes * 60)
+                if dynamis_active_session then
+                    dynamis_active_session.expiry_time = expiry
+                    dynamis_active_session.last_update = now_ts
+                    log(string.format('Dynamis session updated: %s - %d minutes remaining.',
+                        dynamis_active_session.zone_name, minutes))
+                else
+                    dynamis_active_session = {
+                        zone_id     = 0,
+                        zone_name   = 'Unknown',
+                        expiry_time = expiry,
+                        last_update = now_ts,
+                    }
+                    log(string.format('Dynamis session created from chat: %d minutes remaining.', minutes))
+                end
+                dlog(string.format('Dynamis session expiry set: %s (in %d minutes, epoch=%d).',
+                    dynamis_active_session.zone_name, minutes, expiry))
+            end
+        end
+
+        -- Time extension
+        local extend_minutes = string.match(dyn_msg, 'your stay in dynamis has been extended by (%d+) minutes?')
+        if extend_minutes then
+            local minutes = tonumber(extend_minutes)
+            if minutes and minutes > 0 then
+                local now_ts = os.time()
+                if dynamis_active_session then
+                    dynamis_active_session.expiry_time = dynamis_active_session.expiry_time + (minutes * 60)
+                    dynamis_active_session.last_update = now_ts
+                    local remaining = math.max(0, dynamis_active_session.expiry_time - now_ts)
+                    log(string.format('Dynamis session extended: +%d minutes (%s). Total remaining: %d minutes.',
+                        minutes, dynamis_active_session.zone_name, math.ceil(remaining / 60)))
+                else
+                    dlog(string.format('Dynamis extension chat detected but no active session. Creating one with %d minutes.',
+                        minutes))
+                    dynamis_active_session = {
+                        zone_id     = 0,
+                        zone_name   = 'Unknown',
+                        expiry_time = now_ts + (minutes * 60),
+                        last_update = now_ts,
+                    }
+                end
+            end
+        end
+    end
+
+    -- Skip injected messages for all other processing (quest phrases, kills, etc.)
+    if e.injected then return end
 
     -- Identify the current character
     local name = get_current_char_name()
@@ -2436,6 +2523,9 @@ end)
 -- ============================================================================
 -- Detects when the player zones into a Dynamis zone. Records the entry
 -- (up to DYNAMIS_MAX_ENTRIES per week) with zone name and timestamp.
+-- If the player leaves and re-enters the same Dynamis zone while the timer
+-- is still running (active session tracked via chat messages), it is NOT
+-- counted again.
 ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e)
     if e.id ~= 0x00A then return end
 
@@ -2445,7 +2535,35 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e
     -- Zone ID at offset 0x30 (uint32 LE) -> 1-based offset 0x31
     local zone_id = u32le(pkt, 0x30 + 1)
     local zone_name = DYNAMIS_ZONES[zone_id]
-    if not zone_name then return end
+
+    -- Zoning into a non-Dynamis zone: clear active session
+    if not zone_name then
+        if dynamis_active_session then
+            dlog(string.format('Zoned to non-Dynamis zone (id=%d) - clearing active Dynamis session (%s, expiry in %ds).',
+                zone_id, dynamis_active_session.zone_name,
+                math.max(0, dynamis_active_session.expiry_time - os.time())))
+            -- Don't clear - the session expiry is tracked by time.
+            -- The player might zone out briefly and come back.
+            -- The session is only truly over when the timer expires.
+        end
+        return
+    end
+
+    -- Dynamis zone detected
+    dlog(string.format('0x00A zone-in: %s (id=%d)', zone_name, zone_id))
+
+    -- Check if there is an active Dynamis session (timer still running).
+    -- If so, this is a re-entry (e.g. d/c or voluntary zone-out) - don't count it.
+    if is_dynamis_session_active() then
+        dlog(string.format('Dynamis zone-in %s (id=%d) - active session exists (%s, expiry in %ds). Treating as re-entry.',
+            zone_name, zone_id, dynamis_active_session.zone_name,
+            math.max(0, dynamis_active_session.expiry_time - os.time())))
+        -- Update the session's zone in case they re-entered a different dynamis zone
+        -- (shouldn't normally happen, but be safe)
+        dynamis_active_session.zone_id = zone_id
+        dynamis_active_session.zone_name = zone_name
+        return
+    end
 
     local name = get_current_char_name()
     if not name then return end
@@ -2468,6 +2586,18 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e
     cd.dynamis[#cd.dynamis + 1] = entry
     log(string.format('Dynamis entrance %d/%d: %s', #cd.dynamis, DYNAMIS_MAX_ENTRIES, zone_name))
     save_data()
+
+    -- Initialize the active session. The expiry will be set properly when the
+    -- "expelled from Dynamis in X minutes" chat message arrives. For now, set a
+    -- generous placeholder so that a rapid zone-out/zone-in before the first time
+    -- message is still treated as the same session.
+    dynamis_active_session = {
+        zone_id     = zone_id,
+        zone_name   = zone_name,
+        expiry_time = os.time() + 120,  -- 2 min placeholder until time chat message arrives
+        last_update = os.time(),
+    }
+    dlog(string.format('Initialized Dynamis session: %s (placeholder expiry in 120s).', zone_name))
 end)
 
 -- ============================================================================
