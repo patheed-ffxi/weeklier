@@ -6,7 +6,7 @@ addon.name    = 'weeklier'
 addon.author  = 'Pathead'
 addon.version = '0.4a'
 addon.desc    = 'Tracks weekly quest completion across characters.'
-addon.link    = ''
+addon.link    = 'https://github.com/patheed-ffxi/weeklier'
 
 local json = require('json')
 
