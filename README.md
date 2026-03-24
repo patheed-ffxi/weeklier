@@ -12,7 +12,7 @@ An [Ashita v4](https://www.ashitaxi.com/) addon for [HorizonXI](https://horizonx
 
 ## Screenshot
 
-![Weeklier UI](example2.png)
+![Weeklier UI](example.png)
 
 ## Tracked Content
 
