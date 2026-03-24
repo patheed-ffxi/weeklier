@@ -4,7 +4,7 @@ local imgui = require('imgui')
 
 addon.name    = 'weeklier'
 addon.author  = 'Pathead'
-addon.version = '0.2a'
+addon.version = '0.4a'
 addon.desc    = 'Tracks weekly quest completion across characters.'
 addon.link    = ''
 
@@ -83,14 +83,14 @@ end
 -- Status is derived from live packet data for the current character and
 -- persisted to JSON so it can be viewed when logged into a different character.
 --
--- For ENM quests (type = 'enm'):
+-- For ENM / Limbus quests (type = 'enm'):
 --   ki_quest_active     : KI name (from key_item.lua) used to verify possession via packet.
 --   ki_display_name     : The human-readable KI name as it appears in the chat message
 --                         "Obtained key item: <ki_display_name>."  Used to detect when the
 --                         KI was obtained and start the cooldown timer.
---   enm_cooldown_days   : Number of real days for the cooldown (default 5).
---   ENMs are displayed in their own section in the UI, separate from weekly quests.
---   ENM cooldown data is NOT reset on weekly rollover - it uses its own timer.
+--   enm_cooldown_days   : Number of real days for the cooldown (default 5 for ENMs, 3 for Limbus).
+--   ENMs / Limbus are displayed in their own section in the UI, separate from weekly quests.
+--   Cooldown data is NOT reset on weekly rollover - it uses its own timer.
 --
 -- For kill-based quests (type = 'kill_mob'):
 --   kill_mob            : mob name to watch for in "defeats the <mob>" messages
@@ -137,6 +137,13 @@ local QUESTS = {
         name                    = 'Requiem of Sin',
         ki_quest_active         = 'LETTER_FROM_THE_MITHRAN_TRACKERS',
         ki_active_is_completion = true,
+    },
+    {
+        name                = 'Limbus - Cosmo Cleanse',
+        type                = 'enm',
+        ki_quest_active     = 'COSMO_CLEANSE',
+        ki_display_name     = 'Cosmo-Cleanse',
+        enm_cooldown_days   = 3,
     },
     {
         name                = 'Monarch Linn ENM',
@@ -1443,11 +1450,11 @@ local function render_ui()
                     end
 
                     -- ==================================================
-                    -- ENM SECTION (collapsible)
+                    -- ENM / LIMBUS SECTION (collapsible)
                     -- ==================================================
                     if #enm_quests > 0 then
                         imgui.Spacing()
-                        if imgui.CollapsingHeader('ENMs (Cooldown-Based)', ImGuiTreeNodeFlags_DefaultOpen) then
+                        if imgui.CollapsingHeader('ENM / Limbus (Cooldown-Based)', ImGuiTreeNodeFlags_DefaultOpen) then
 
                             imgui.Columns(6, '##enmCols', true)
                             imgui.SetColumnWidth(0, 30)
@@ -1457,7 +1464,7 @@ local function render_ui()
                             imgui.SetColumnWidth(4, 100)
                             imgui.Text('')
                             imgui.NextColumn()
-                            imgui.Text('ENM')
+                            imgui.Text('Name')
                             imgui.NextColumn()
                             imgui.Text('Has KI')
                             imgui.NextColumn()
@@ -1648,7 +1655,7 @@ local function render_ui()
                 for _, q in ipairs(QUESTS) do
                     if is_quest_hidden(q.name) then
                         any_hidden = true
-                        local type_label = q.type == 'enm' and 'ENM' or (q.type == 'kill_mob' and 'Kill' or 'Quest')
+                        local type_label = q.type == 'enm' and 'ENM/Limbus' or (q.type == 'kill_mob' and 'Kill' or 'Quest')
                         imgui.PushID('show_' .. q.name)
                         if imgui.SmallButton('Show') then
                             set_quest_hidden(q.name, false)
@@ -1685,7 +1692,7 @@ local function render_ui()
                 imgui.Spacing()
                 imgui.TextColored({ 1.0, 0.6, 0.4, 1.0 }, 'Manual Status Override')
                 imgui.Separator()
-                imgui.TextWrapped('Manually set the status for any quest, ENM, or Dynamis entry. Select a character, then change values. For the current character, live packet data may re-derive some statuses automatically.')
+                imgui.TextWrapped('Manually set the status for any quest, ENM / Limbus, or Dynamis entry. Select a character, then change values. For the current character, live packet data may re-derive some statuses automatically.')
                 imgui.Spacing()
 
                 -- Build character list
@@ -1750,9 +1757,9 @@ local function render_ui()
                             end
                         end
 
-                        -- ---- ENMs ----
+                        -- ---- ENMs / Limbus ----
                         imgui.Spacing()
-                        if imgui.CollapsingHeader('Override: ENMs##ovr_enm') then
+                        if imgui.CollapsingHeader('Override: ENM / Limbus##ovr_enm') then
                             for _, q in ipairs(QUESTS) do
                                 if q.type == 'enm' then
                                     if not ocd.enms then ocd.enms = {} end
