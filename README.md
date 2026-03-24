@@ -5,7 +5,7 @@ An [Ashita v4](https://www.ashitaxi.com/) addon for [HorizonXI](https://horizonx
 ## Features
 
 - **Multi-character tracking** - Quest status is persisted to JSON so you can view progress for all characters from any character.
-- **Automatic detection** - Status is derived from live packet data (key items via `0x055`, quest log via `0x056`) and chat message parsing. No manual check-offs needed.
+- **Automatic detection** - Status is derived from live packet data (key items via `0x055`, quest log via `0x056`, zone-in via `0x00A`) and chat message parsing. No manual check-offs needed.
 - **Weekly reset countdown** - Displays the current week and a live countdown to the next reset (midnight Monday JST / Sunday 15:00 UTC).
 - **ImGui UI** - Tabbed interface with a tab per character, collapsible sections, and color-coded statuses.
 - **Configurable** - Add or remove quests by editing the `QUESTS` table in the Lua file.
@@ -33,9 +33,9 @@ Pre-configured quests:
 - Spice Gals
 - Requiem of Sin
 
-### ENMs (Cooldown-Based)
+### ENM / Limbus (Cooldown-Based)
 
-ENMs have an independent cooldown timer (typically 5 days) rather than following the weekly reset. The addon tracks when the key item was obtained and displays a countdown until the next one can be acquired.
+ENMs and Limbus have an independent cooldown timer rather than following the weekly reset. ENMs typically have a 5-day cooldown, while Limbus has a 3-day cooldown. The addon tracks when the key item was obtained and displays a countdown until the next one can be acquired.
 
 Pre-configured ENMs:
 - Monarch Linn ENM
@@ -47,6 +47,9 @@ Pre-configured ENMs:
 - Mea: Playing Host
 - Holla: Simulant
 - Vahzl: Pulling the Plug
+
+Pre-configured Limbus:
+- Limbus (Cosmo-Cleanse, 3-day cooldown)
 
 ### Kill-Based Quests
 
@@ -63,10 +66,27 @@ A special round-robin system tracking the three Eco Warrior quests (San d'Oria, 
 |---|---|
 | Available | Can be flagged this week |
 | Flagged | Quest is currently active |
+| Return to NPC | KI obtained, needs in-zone verification before turning in |
+| Need To Complete | Verified in-zone, return to quest giver to complete |
 | Completed | Completed this week |
 | Not Available | Another nation was done this week, or this nation must wait its turn |
 
 A manual override is available in the Config tab to bootstrap the round-robin cycle for existing characters.
+
+### Dynamis
+
+Tracks Dynamis entries (up to 2 per week per character, same weekly reset). The addon detects zone-ins to any Dynamis zone via the `0x00A` packet and records the zone name and timestamp.
+
+To prevent leaving and re-entering the same Dynamis zone from counting as a second entry, the addon tracks the active session timer by parsing system chat messages:
+- "You will be expelled from Dynamis in X minutes (Earth time)." - sets the session expiry
+- "Your stay in Dynamis has been extended by X minutes." - extends the session expiry
+
+While the session timer is still running, subsequent zone-ins are treated as re-entries and are not counted.
+
+Supported zones:
+- Dynamis - Valkurm, Buburimu, Qufim, Tavnazia
+- Dynamis - Beaucedine, Xarcabard
+- Dynamis - San d'Oria, Bastok, Windurst, Jeuno
 
 ## Detection Methods
 
@@ -74,7 +94,8 @@ The addon uses multiple detection methods depending on the quest type:
 
 - **Packet 0x055 (Key Items)** - Monitors the key item bitmap to detect when quest-related KIs are obtained or removed. KI removal is used to detect quest completion or objective completion.
 - **Packet 0x056 (Quest Log)** - Reads the active quest bitmap to determine if a quest is currently flagged.
-- **Chat parsing** - Some quests use chat message detection as a fallback for bugged quests that don't appear correctly in the quest log.
+- **Packet 0x00A (Zone-In)** - Detects when the player enters a Dynamis zone to track weekly entrances.
+- **Chat parsing** - Detects quest flag/completion phrases for bugged quests that don't appear correctly in the quest log. Also used to track Dynamis session timers (injected system messages) and Eco Warrior in-zone verification steps.
 
 ## Installation
 
@@ -115,7 +136,7 @@ Edit the `QUESTS` table near the top of `weeklier.lua`. Each quest entry support
     ki_quest_incomplete = 'KEY_ITEM_NAME',        -- KI held until turn-in
 
     -- Chat-based detection (fallback for bugged quests)
-    flag_phrase         = 'npc dialogue text',    -- Chat text when quest is flagged
+    flag_phrase         = 'npc dialogue text',    -- Chat text when quest is flagged (string or table of strings)
     complete_phrase     = 'npc dialogue text',    -- Chat text when quest is completed
 }
 ```
@@ -124,9 +145,13 @@ Edit the `QUESTS` table near the top of `weeklier.lua`. Each quest entry support
 
 Click the `x` button next to any quest in the UI to hide it. Hidden quests can be restored from the Config tab.
 
+### Manual Status Override
+
+The Config tab provides a manual status override for any quest, ENM / Limbus, Eco Warrior nation, or Dynamis entry. This is useful for bootstrapping data on characters that have already completed content before installing the addon.
+
 ## Data Storage
 
-All data is saved to `char_data.json` in the addon directory. This includes per-character quest status, ENM cooldown timers, Eco Warrior rotation history, and UI preferences (hidden quests).
+All data is saved to `char_data.json` in the addon directory. This includes per-character quest status, ENM / Limbus cooldown timers, Eco Warrior rotation history, Dynamis entry logs, and UI preferences (hidden quests).
 
 ## Dependencies
 
