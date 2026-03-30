@@ -104,7 +104,7 @@ end
 -- ============================================================================
 
 -- How many seconds after a "defeats the X" message to wait for the XP message
-local KILL_CONFIRM_WINDOW = 30.0
+local KILL_CONFIRM_WINDOW = 5.0
 
 -- Debug mode: when true, logs detailed diagnostic info about status changes,
 -- packet processing, KI checks, quest active checks, etc.
@@ -2202,6 +2202,13 @@ end)
 ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
     if not e.message or e.message == '' then return end
 
+    -- Ignore our own log/dlog output to prevent recursive matching.
+    -- log() prints "[weeklier]" and dlog() prints "[weeklier:DBG]".
+    if string.find(e.message, '[weeklier', 1, true) then return end
+
+    local msg = normalize_string(e.message)
+    if not msg then return end
+
     -- ------------------------------------------------------------------
     -- Dynamis session time tracking (chat-based)
     -- ------------------------------------------------------------------
@@ -2210,61 +2217,73 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
     --
     -- "You will be expelled from Dynamis in X minute(s) (Earth time)." -> set expiry
     -- "Your stay in Dynamis has been extended by X minutes."           -> extend expiry
-    local dyn_msg = normalize_string(e.message)
-    if dyn_msg then
-        -- Expulsion warning (singular and plural)
-        local expel_minutes = string.match(dyn_msg, 'you will be expelled from dynamis in (%d+) minutes?')
-        if expel_minutes then
-            local minutes = tonumber(expel_minutes)
-            if minutes and minutes > 0 then
-                local now_ts = os.time()
-                local expiry = now_ts + (minutes * 60)
-                if dynamis_active_session then
-                    dynamis_active_session.expiry_time = expiry
-                    dynamis_active_session.last_update = now_ts
-                    log(string.format('Dynamis session updated: %s - %d minutes remaining.',
-                        dynamis_active_session.zone_name, minutes))
-                else
-                    dynamis_active_session = {
-                        zone_id     = 0,
-                        zone_name   = 'Unknown',
-                        expiry_time = expiry,
-                        last_update = now_ts,
-                    }
-                    log(string.format('Dynamis session created from chat: %d minutes remaining.', minutes))
-                end
-                dlog(string.format('Dynamis session expiry set: %s (in %d minutes, epoch=%d).',
-                    dynamis_active_session.zone_name, minutes, expiry))
-            end
-        end
 
-        -- Time extension
-        local extend_minutes = string.match(dyn_msg, 'your stay in dynamis has been extended by (%d+) minutes?')
-        if extend_minutes then
-            local minutes = tonumber(extend_minutes)
-            if minutes and minutes > 0 then
-                local now_ts = os.time()
-                if dynamis_active_session then
-                    dynamis_active_session.expiry_time = dynamis_active_session.expiry_time + (minutes * 60)
-                    dynamis_active_session.last_update = now_ts
-                    local remaining = math.max(0, dynamis_active_session.expiry_time - now_ts)
-                    log(string.format('Dynamis session extended: +%d minutes (%s). Total remaining: %d minutes.',
-                        minutes, dynamis_active_session.zone_name, math.ceil(remaining / 60)))
-                else
-                    dlog(string.format('Dynamis extension chat detected but no active session. Creating one with %d minutes.',
-                        minutes))
-                    dynamis_active_session = {
-                        zone_id     = 0,
-                        zone_name   = 'Unknown',
-                        expiry_time = now_ts + (minutes * 60),
-                        last_update = now_ts,
-                    }
-                end
+    -- Expulsion warning (singular and plural)
+    local expel_minutes = string.match(msg, 'you will be expelled from dynamis in (%d+) minutes?')
+    if expel_minutes then
+        local minutes = tonumber(expel_minutes)
+        if minutes and minutes > 0 then
+            local now_ts = os.time()
+            local expiry = now_ts + (minutes * 60)
+            if dynamis_active_session then
+                dynamis_active_session.expiry_time = expiry
+                dynamis_active_session.last_update = now_ts
+                log(string.format('Dynamis session updated: %s - %d minutes remaining.',
+                    dynamis_active_session.zone_name, minutes))
+            else
+                dynamis_active_session = {
+                    zone_id     = 0,
+                    zone_name   = 'Unknown',
+                    expiry_time = expiry,
+                    last_update = now_ts,
+                }
+                log(string.format('Dynamis session created from chat: %d minutes remaining.', minutes))
+            end
+            dlog(string.format('Dynamis session expiry set: %s (in %d minutes, epoch=%d).',
+                dynamis_active_session.zone_name, minutes, expiry))
+        end
+    end
+
+    -- Time extension
+    local extend_minutes = string.match(msg, 'your stay in dynamis has been extended by (%d+) minutes?')
+    if extend_minutes then
+        local minutes = tonumber(extend_minutes)
+        if minutes and minutes > 0 then
+            local now_ts = os.time()
+            if dynamis_active_session then
+                dynamis_active_session.expiry_time = dynamis_active_session.expiry_time + (minutes * 60)
+                dynamis_active_session.last_update = now_ts
+                local remaining = math.max(0, dynamis_active_session.expiry_time - now_ts)
+                log(string.format('Dynamis session extended: +%d minutes (%s). Total remaining: %d minutes.',
+                    minutes, dynamis_active_session.zone_name, math.ceil(remaining / 60)))
+            else
+                dlog(string.format('Dynamis extension chat detected but no active session. Creating one with %d minutes.',
+                    minutes))
+                dynamis_active_session = {
+                    zone_id     = 0,
+                    zone_name   = 'Unknown',
+                    expiry_time = now_ts + (minutes * 60),
+                    last_update = now_ts,
+                }
             end
         end
     end
 
-    -- Skip injected messages for all other processing (quest phrases, kills, etc.)
+    -- ------------------------------------------------------------------
+    -- Kill-mob phase 1: look for "defeats the <mob>" (injected message)
+    -- Must be checked before the e.injected early-return below.
+    -- ------------------------------------------------------------------
+    for qi, q in ipairs(QUESTS) do
+        if q.type == 'kill_mob' and q.kill_mob and q.kill_mob ~= '' then
+            local defeat_phrase = 'defeats the ' .. normalize_string(q.kill_mob)
+            if string.find(msg, defeat_phrase, 1, true) then
+                pending_kills[qi] = os.clock()
+                log(string.format('Mob defeated: %s - waiting for XP confirm...', q.kill_mob))
+            end
+        end
+    end
+
+    -- Skip injected messages for all other processing (quest phrases, etc.)
     if e.injected then return end
 
     -- Identify the current character
@@ -2277,14 +2296,12 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
         ensure_char(name)
     end
 
-    local msg = normalize_string(e.message)
-    if not msg then return end
     local now = os.clock()
 
     -- ------------------------------------------------------------------
-    -- Phase 2 of kill detection: look for XP gain from this character.
-    -- Must come BEFORE we check for new "defeats" lines so that a single
-    -- text_in pass can't latch + confirm on the same frame.
+    -- Kill-mob phase 2: look for XP gain to confirm a pending kill.
+    -- The "defeats the X" message (injected) always arrives before the
+    -- XP message (non-injected) as separate text_in events.
     -- Pattern: "<charname> gains 1234 experience points."
     -- ------------------------------------------------------------------
     if next(pending_kills) then
@@ -2319,7 +2336,7 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
     -- ------------------------------------------------------------------
     -- Check every quest definition
     -- ------------------------------------------------------------------
-    for qi, q in ipairs(QUESTS) do
+    for _, q in ipairs(QUESTS) do
 
         -- ==============================================================
         -- Flag phrase detection (chat-based alternative to quest_log_id)
@@ -2358,17 +2375,6 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
                     log(string.format('ENM KI obtained: %s - %d day cooldown started.', q.name, cooldown))
                     save_data()
                 end
-            end
-        end
-
-        -- ==============================================================
-        -- Kill-mob quest: phase 1 - look for "defeats the <mob>"
-        -- ==============================================================
-        if q.type == 'kill_mob' and q.kill_mob and q.kill_mob ~= '' then
-            local defeat_phrase = 'defeats the ' .. normalize_string(q.kill_mob)
-            if string.find(msg, defeat_phrase, 1, true) then
-                pending_kills[qi] = now
-                log(string.format('Mob defeated: %s - waiting for XP confirm...', q.kill_mob))
             end
         end
     end
