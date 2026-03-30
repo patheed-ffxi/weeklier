@@ -104,7 +104,7 @@ end
 -- ============================================================================
 
 -- How many seconds after a "defeats the X" message to wait for the XP message
-local KILL_CONFIRM_WINDOW = 5.0
+local KILL_CONFIRM_WINDOW = 30.0
 
 -- Debug mode: when true, logs detailed diagnostic info about status changes,
 -- packet processing, KI checks, quest active checks, etc.
@@ -252,7 +252,8 @@ local QUESTS = {
 --   'Need To Complete' - player has verified the KI, needs to return to quest giver
 --   'Completed'        - completed this week
 --   'Not Available'    - another nation was flagged/completed this week, OR
---                        this nation was completed more recently than others
+--                        this nation has already been completed in the current
+--                        round-robin cycle (must do other nations first)
 --
 -- Stored per character in data[char].eco[nation_key] = {
 --   completed_week  = "2026-W10" or nil  (the week key when last completed)
@@ -260,6 +261,10 @@ local QUESTS = {
 --   stored_flagged  = true/nil           (set by flag_phrase, cleared on completion)
 --   stored_verified = true/nil           (set by verify_phrase, cleared on completion)
 -- }
+--
+-- Round-robin cycle tracking: data[char].eco_cycle = { [nation_key] = true }
+-- Tracks which nations have been completed in the current cycle. When all
+-- nations are completed, eco_cycle is cleared (all become available again).
 -- ============================================================================
 local ECO_WARRIORS = {
     {
@@ -325,7 +330,7 @@ local DYNAMIS_MAX_ENTRIES = 2
 local save_path                             -- set in load_cb (addon.path available then)
 local show_window = { false }               -- imgui bool wrapper
 local select_current_tab = false            -- when true, auto-select current char tab on next frame
-local data = {}                             -- { [char_name] = { week, quests, enms, eco }, _hidden = { [name] = true } }
+local data = {}                             -- { [char_name] = { week, quests, enms, eco, eco_cycle, dynamis }, _hidden = { [name] = true } }
 local current_char                          -- detected from party info
 local last_packet_char                      -- tracks which char the packet-derived bitmaps belong to
 
@@ -760,6 +765,30 @@ local function ensure_char(name)
         end
     end
 
+    -- Ensure eco_cycle tracking exists (tracks which nations have been completed in
+    -- the current round-robin cycle; resets when all nations are done)
+    if not data[name].eco_cycle then
+        data[name].eco_cycle = {}
+        -- Migration: infer cycle state from existing completed_week data.
+        -- If all nations have a completed_week, the last full cycle is done -> empty cycle.
+        -- If only some have completed_week, those nations are "done" in the current cycle.
+        local all_have_week = true
+        for _, ew in ipairs(ECO_WARRIORS) do
+            if not (data[name].eco[ew.key] and data[name].eco[ew.key].completed_week) then
+                all_have_week = false
+                break
+            end
+        end
+        if not all_have_week then
+            for _, ew in ipairs(ECO_WARRIORS) do
+                if data[name].eco[ew.key] and data[name].eco[ew.key].completed_week then
+                    data[name].eco_cycle[ew.key] = true
+                end
+            end
+        end
+        -- If all_have_week, eco_cycle stays empty (full cycle complete, all available)
+    end
+
     -- Ensure dynamis tracking table exists
     if not data[name].dynamis then
         data[name].dynamis = {}
@@ -1016,6 +1045,23 @@ local function process_ki_removals(table_index)
                             cd.eco[ew.key].completed_week = week
                             cd.eco[ew.key].stored_flagged = nil
                             cd.eco[ew.key].stored_verified = nil
+
+                            -- Track round-robin cycle completion
+                            if not cd.eco_cycle then cd.eco_cycle = {} end
+                            cd.eco_cycle[ew.key] = true
+                            -- Check if all nations are done in this cycle
+                            local cycle_complete = true
+                            for _, check_ew in ipairs(ECO_WARRIORS) do
+                                if not cd.eco_cycle[check_ew.key] then
+                                    cycle_complete = false
+                                    break
+                                end
+                            end
+                            if cycle_complete then
+                                log('Eco Warrior: full round-robin cycle complete - all nations will be available next.')
+                                cd.eco_cycle = {}
+                            end
+
                             save_data()
                         end
                     end
@@ -1059,10 +1105,9 @@ end
 --      but no KI yet) -> 'Flagged'
 --   4. If this nation was completed THIS week -> 'Completed'
 --   5. If another nation is flagged or completed this week -> 'Not Available'
---   6. Round-robin check: a nation is 'Available' only if all nations that were
---      completed MORE RECENTLY have been done. i.e. you must do each nation
---      before repeating one. If this nation was completed more recently than
---      at least one other nation, it's 'Not Available'.
+--   6. Round-robin check using eco_cycle: a nation is 'Available' only if it has
+--      NOT been completed in the current round-robin cycle (eco_cycle[key] is nil).
+--      When all nations are completed, eco_cycle is cleared and all become available.
 --   7. Otherwise -> 'Available'
 --
 local function derive_eco_statuses(cd, is_current_char)
@@ -1118,10 +1163,11 @@ local function derive_eco_statuses(cd, is_current_char)
         if completed_this_week then any_completed_this_week = true end
     end
 
-    -- Second pass: determine display status
-    -- Build a sorted list of completion weeks for the round-robin check
-    -- A nation is "available" if no other nation has a LESS recent (or nil)
-    -- completed_week. i.e. nations with nil or oldest completed_week go first.
+    -- Second pass: determine display status using eco_cycle for round-robin tracking.
+    -- eco_cycle contains the keys of nations completed in the current round-robin cycle.
+    -- When all nations are done, eco_cycle is cleared (all become available again).
+    local eco_cycle = cd.eco_cycle or {}
+
     for _, ew in ipairs(ECO_WARRIORS) do
         local r = results[ew.key]
 
@@ -1137,29 +1183,14 @@ local function derive_eco_statuses(cd, is_current_char)
             -- Another nation is active/completed this week
             r.status = 'Not Available'
         else
-            -- Round-robin check: this nation is available only if it wasn't
-            -- completed more recently than ALL other nations.
-            -- A nation with nil completed_week is considered oldest (available first).
-            local my_week = r.completed_week  -- may be nil
-            local dominated = false
-            for _, other_ew in ipairs(ECO_WARRIORS) do
-                if other_ew.key ~= ew.key then
-                    local other_week = results[other_ew.key].completed_week
-                    -- If another nation has never been done (nil) or was done
-                    -- in an older week, then that nation should go first, making
-                    -- this one not available (unless this one is also nil/older).
-                    if other_week == nil and my_week ~= nil then
-                        -- Other has never been done but I have -> I'm blocked
-                        dominated = true
-                        break
-                    elseif other_week ~= nil and my_week ~= nil and other_week < my_week then
-                        -- Other was done longer ago than me -> they should go first
-                        dominated = true
-                        break
-                    end
-                end
+            -- Round-robin check: this nation is available only if it has NOT been
+            -- completed in the current cycle. When all nations are completed,
+            -- eco_cycle is cleared and all become available again.
+            if eco_cycle[ew.key] then
+                r.status = 'Not Available'
+            else
+                r.status = 'Available'
             end
-            r.status = dominated and 'Not Available' or 'Available'
         end
     end
 
@@ -1858,6 +1889,10 @@ local function render_ui()
                                         eco.completed_week = nil
                                         eco.stored_flagged = nil
                                         eco.stored_verified = nil
+                                        -- Remove from round-robin cycle tracking
+                                        if ocd.eco_cycle then
+                                            ocd.eco_cycle[ew.key] = nil
+                                        end
                                         log(string.format('Manual override: Eco %s [%s] completion cleared',
                                             ew.nation, override_selected_char))
                                         save_data()
@@ -1867,6 +1902,21 @@ local function render_ui()
                                         eco.completed_week = ovr_week
                                         eco.stored_flagged = nil
                                         eco.stored_verified = nil
+                                        -- Track round-robin cycle completion
+                                        if not ocd.eco_cycle then ocd.eco_cycle = {} end
+                                        ocd.eco_cycle[ew.key] = true
+                                        -- Check if all nations are done in this cycle
+                                        local cycle_complete = true
+                                        for _, check_ew in ipairs(ECO_WARRIORS) do
+                                            if not ocd.eco_cycle[check_ew.key] then
+                                                cycle_complete = false
+                                                break
+                                            end
+                                        end
+                                        if cycle_complete then
+                                            log('Manual override: Eco full round-robin cycle complete - all nations will be available next.')
+                                            ocd.eco_cycle = {}
+                                        end
                                         log(string.format('Manual override: Eco %s [%s] completed %s',
                                             ew.nation, override_selected_char, ovr_week))
                                         save_data()
