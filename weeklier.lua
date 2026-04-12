@@ -373,6 +373,18 @@ end
 local pending_kills = {}
 
 -- ============================================================================
+-- ENM / Limbus Alert System
+-- ============================================================================
+-- Periodically checks ENM cooldowns and sends a chat notification when a
+-- key item becomes ready to obtain (cooldown expired).
+-- Tracked per-character via enm_data.notified_ready = true/false.
+-- Cleared when a new KI is obtained (cooldown starts), so the next expiry
+-- triggers a fresh alert.
+local ENM_ALERT_CHECK_INTERVAL = 60      -- seconds between periodic checks
+local enm_alert_last_check = 0           -- os.time() of last periodic check
+local enm_alert_login_done = {}          -- { [char_name] = true } login alert fired this session
+
+-- ============================================================================
 -- Key Item Tracking (packet 0x055)
 -- ============================================================================
 -- Bitmap of obtained key items.  Indexed [table_index][dword_index] = uint32.
@@ -1281,6 +1293,59 @@ local function get_enm_status(enm_data, q)
     end
 end
 
+-- ============================================================================
+-- ENM / Limbus Alert Check
+-- ============================================================================
+-- Checks all ENM quests for the given character. If a cooldown has expired
+-- and the player hasn't been notified yet, sends a chat notification and
+-- sets the notified_ready flag. Called on login and periodically.
+-- is_login_check: if true, groups all ready ENMs into a single summary message.
+local function check_enm_alerts(char_name, is_login_check)
+    if not char_name then return end
+    local cd = data[char_name]
+    if not cd or not cd.enms then return end
+
+    local ready_names = {}
+
+    for _, q in ipairs(QUESTS) do
+        if q.type == 'enm' then
+            local enm_data = cd.enms[q.name]
+            if enm_data then
+                local cooldown_secs = (q.enm_cooldown_days or 5) * 86400
+                local obtained = enm_data.ki_obtained_time
+
+                -- Determine if the ENM is ready
+                local is_ready = false
+                if not obtained then
+                    is_ready = true   -- never obtained = always ready
+                elseif os.time() >= (obtained + cooldown_secs) then
+                    is_ready = true   -- cooldown expired
+                end
+
+                if is_ready and not enm_data.notified_ready then
+                    enm_data.notified_ready = true
+                    ready_names[#ready_names + 1] = q.name
+                    dlog(string.format('ENM alert: %s is READY for %s', q.name, char_name))
+                end
+            end
+        end
+    end
+
+    if #ready_names > 0 then
+        save_data()
+        if is_login_check then
+            -- Single summary message on login
+            log(string.format('\30\08%d ENM/Limbus key item(s) READY:\30\01 %s',
+                #ready_names, table.concat(ready_names, ', ')))
+        else
+            -- Individual alert per newly-ready ENM during play
+            for _, rn in ipairs(ready_names) do
+                log(string.format('\30\08%s\30\01 is now READY! Key item can be obtained.', rn))
+            end
+        end
+    end
+end
+
 local function render_ui()
     if not show_window[1] then return end
 
@@ -1823,6 +1888,7 @@ local function render_ui()
                                     imgui.PushID('ovr_enm_cdn_' .. q.name)
                                     if imgui.SmallButton('Start CD') then
                                         enm.ki_obtained_time = os.time()
+                                        enm.notified_ready = nil  -- reset alert flag
                                         log(string.format('Manual override: %s [%s] cooldown started now',
                                             q.name, override_selected_char))
                                         save_data()
@@ -1833,6 +1899,7 @@ local function render_ui()
                                     imgui.PushID('ovr_enm_cdc_' .. q.name)
                                     if imgui.SmallButton('Clear CD') then
                                         enm.ki_obtained_time = nil
+                                        enm.notified_ready = nil  -- reset alert flag so READY alert fires
                                         log(string.format('Manual override: %s [%s] cooldown cleared',
                                             q.name, override_selected_char))
                                         save_data()
@@ -2376,6 +2443,7 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
                     if not cd.enms then cd.enms = {} end
                     if not cd.enms[q.name] then cd.enms[q.name] = {} end
                     cd.enms[q.name].ki_obtained_time = os.time()
+                    cd.enms[q.name].notified_ready = nil  -- clear alert flag so next expiry triggers a new notification
                     local cooldown = q.enm_cooldown_days or 5
                     log(string.format('ENM KI obtained: %s - %d day cooldown started.', q.name, cooldown))
                     save_data()
@@ -2688,6 +2756,19 @@ ashita.events.register('d3d_present', 'weeklier_present_cb', function()
         if current_char ~= name then
             current_char = name
             ensure_char(name)
+        end
+
+        -- ENM alert: one-time login check for the current character
+        if not enm_alert_login_done[name] then
+            enm_alert_login_done[name] = true
+            check_enm_alerts(name, true)
+        end
+
+        -- ENM alert: periodic check (once per ENM_ALERT_CHECK_INTERVAL seconds)
+        local now_ts = os.time()
+        if (now_ts - enm_alert_last_check) >= ENM_ALERT_CHECK_INTERVAL then
+            enm_alert_last_check = now_ts
+            check_enm_alerts(name, false)
         end
     end
 
