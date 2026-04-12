@@ -824,15 +824,20 @@ end
 
 -- Checks if the character has changed since the last packet processing and, if so,
 -- clears stale packet state. Call this at the top of packet handlers.
+-- Returns true if a character change was detected (callers may want to skip
+-- processing the current packet to avoid acting on stale data).
 local function check_packet_char_change()
     local name = get_current_char_name()
-    if not name then return end
+    if not name then return false end
     if last_packet_char and last_packet_char ~= name then
         dlog(string.format('Character change detected (%s -> %s) - clearing packet state.',
             last_packet_char, name))
         clear_packet_state()
+        last_packet_char = name
+        return true
     end
     last_packet_char = name
+    return false
 end
 
 -- ============================================================================
@@ -2591,6 +2596,16 @@ end)
 -- counted again.
 ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e)
     if e.id ~= 0x00A then return end
+
+    -- Clear stale packet state if the character has changed since last packet.
+    -- If a change IS detected, skip this packet entirely: the 0x00A is the first
+    -- packet to arrive during login, so the zone data inside it may still reflect
+    -- the previous character's zone (especially on private servers). Processing it
+    -- could incorrectly record a Dynamis entry for the new character.
+    if check_packet_char_change() then
+        dlog('0x00A: character change detected - skipping packet to avoid stale zone data.')
+        return
+    end
 
     local pkt = e.data
     if not pkt or #pkt < 0x34 then return end
