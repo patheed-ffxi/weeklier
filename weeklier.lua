@@ -2347,8 +2347,11 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
     -- ------------------------------------------------------------------
     for qi, q in ipairs(QUESTS) do
         if q.type == 'kill_mob' and q.kill_mob and q.kill_mob ~= '' then
-            local defeat_phrase = 'defeats the ' .. normalize_string(q.kill_mob)
-            if string.find(msg, defeat_phrase, 1, true) then
+            local mob_norm      = normalize_string(q.kill_mob)
+            local defeat_phrase = 'defeats the ' .. mob_norm
+            local falls_phrase  = mob_norm .. ' falls to the ground'
+            if string.find(msg, defeat_phrase, 1, true)
+               or string.find(msg, falls_phrase, 1, true) then
                 pending_kills[qi] = os.clock()
                 log(string.format('Mob defeated: %s - waiting for XP confirm...', q.kill_mob))
             end
