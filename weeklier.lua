@@ -325,6 +325,46 @@ local DYNAMIS_ZONES = {
 local DYNAMIS_MAX_ENTRIES = 2
 
 -- ============================================================================
+-- EXP Band Config
+-- ============================================================================
+-- Three EXP bands exist (Chariot/Empress/Emperor), but a player can only
+-- hold one at a time. On zone-in, the player's Inventory, Wardrobe, and
+-- Wardrobe2 are scanned for any of these item IDs. If found (and at least 1
+-- charge remains), the next-use timestamp is read from item.Extra and stored.
+-- A chat notification fires when the cooldown expires (similar to ENM alerts).
+-- Stored per character in data[char].exp_band = {
+--   item_id      = numeric item id
+--   name         = display name (e.g. "Chariot Band")
+--   expiry_time  = unix timestamp when the band's use cooldown ends
+--   charges      = remaining charges (>= 1 when stored)
+--   notified_ready = true after the READY alert has fired (cleared on rescan)
+-- }
+local EXP_BANDS = {
+    [15761] = 'Chariot Band',
+    [15762] = 'Empress Band',
+    [15763] = 'Emperor Band',
+}
+
+-- Vana'diel epoch in real-world unix time (used to convert item.Extra
+-- timestamps for use-cooldown items such as EXP bands).
+local VANA_OFFSET = 1009810800
+
+-- Bags scanned for EXP bands (intentionally limited - matches user-supplied
+-- containerMaxes; bands cannot be used from other storage).
+local EXP_BAND_CONTAINER_MAXES = {
+    Inventory = 70,
+    Satchel   = 60,
+    Wardrobe  = 80,
+    Wardrobe2 = 80,
+}
+local EXP_BAND_BAG_NAMES = {
+    [0]  = 'Inventory',
+    [5]  = 'Satchel',
+    [8]  = 'Wardrobe',
+    [10] = 'Wardrobe2',
+}
+
+-- ============================================================================
 -- State
 -- ============================================================================
 local save_path                             -- set in load_cb (addon.path available then)
@@ -383,6 +423,21 @@ local pending_kills = {}
 local ENM_ALERT_CHECK_INTERVAL = 60      -- seconds between periodic checks
 local enm_alert_last_check = 0           -- os.time() of last periodic check
 local enm_alert_login_done = {}          -- { [char_name] = true } login alert fired this session
+
+-- ============================================================================
+-- EXP Band Alert / Settings
+-- ============================================================================
+-- Tracked per character via cd.exp_band.notified_ready.
+-- Settings (global, persisted in data._settings):
+--   exp_band_tracking_enabled : when false, scanning, alerts and the UI
+--                               section are all disabled.
+local DEFAULT_SETTINGS = {
+    exp_band_tracking_enabled = true,
+}
+local settings = {}
+for k, v in pairs(DEFAULT_SETTINGS) do settings[k] = v end
+
+local exp_band_alert_login_done = {}     -- { [char_name] = true }
 
 -- ============================================================================
 -- Key Item Tracking (packet 0x055)
@@ -633,6 +688,7 @@ local function load_data()
     local f = io.open(save_path, 'r')
     if not f then
         data = {}
+        data._settings = settings
         return
     end
     local raw = f:read('*a')
@@ -642,6 +698,7 @@ local function load_data()
     if not ok or type(decoded) ~= 'table' then
         log('Failed to parse save file; starting fresh.')
         data = {}
+        data._settings = settings
         return
     end
     data = decoded
@@ -653,6 +710,16 @@ local function load_data()
         hidden_quests = {}
         data._hidden = hidden_quests
     end
+
+    -- Restore settings (merge over defaults so new settings get defaults).
+    if type(data._settings) == 'table' then
+        for k, _ in pairs(DEFAULT_SETTINGS) do
+            if data._settings[k] ~= nil then
+                settings[k] = data._settings[k]
+            end
+        end
+    end
+    data._settings = settings
 end
 
 local function normalize_string(s)
@@ -1294,6 +1361,99 @@ local function get_enm_status(enm_data, q)
 end
 
 -- ============================================================================
+-- EXP Band Inventory Scan
+-- ============================================================================
+-- Scans Inventory / Wardrobe / Wardrobe2 for any of the EXP band item IDs.
+-- For the first one found with at least 1 charge remaining, reads the
+-- next-use timestamp from item.Extra (bytes 5..8 = LE uint32 vana-relative)
+-- and stores it on the character record.
+-- If none are found (or none have charges), the stored band is cleared.
+local function scan_exp_band_for_char(char_name)
+    if not char_name then return end
+    if not settings.exp_band_tracking_enabled then return end
+
+    local cd = ensure_char(char_name)
+    if not cd then return end
+
+    local inventory = AshitaCore:GetMemoryManager():GetInventory()
+    if not inventory then return end
+
+    local found
+    for bag_id, bag_name in pairs(EXP_BAND_BAG_NAMES) do
+        local max_slots = EXP_BAND_CONTAINER_MAXES[bag_name] or 0
+        for slot = 1, max_slots do
+            local item = inventory:GetContainerItem(bag_id, slot)
+            if item and item.Id and EXP_BANDS[item.Id] and item.Extra and #item.Extra >= 8 then
+                local charges = string.byte(item.Extra, 2) or 0
+                if charges >= 1 then
+                    local extra_ts  = u32le(item.Extra, 5)
+                    local expiry    = extra_ts + VANA_OFFSET
+                    found = {
+                        item_id     = item.Id,
+                        name        = EXP_BANDS[item.Id],
+                        expiry_time = expiry,
+                        charges     = charges,
+                    }
+                    break
+                end
+            end
+        end
+        if found then break end
+    end
+
+    local prev = cd.exp_band
+    if found then
+        -- Preserve notified_ready state if same band & same expiry, else reset.
+        if prev and prev.item_id == found.item_id and prev.expiry_time == found.expiry_time then
+            found.notified_ready = prev.notified_ready
+        end
+        cd.exp_band = found
+        local now = os.time()
+        if found.expiry_time <= now then
+            log(string.format('EXP Band found: %s (%d charge%s) - READY now.',
+                found.name, found.charges, found.charges == 1 and '' or 's'))
+        else
+            log(string.format('EXP Band found: %s (%d charge%s) - ready in %s.',
+                found.name, found.charges, found.charges == 1 and '' or 's',
+                format_countdown(found.expiry_time - now)))
+        end
+        save_data()
+    else
+        if prev then
+            log('EXP Band no longer in inventory (or out of charges) - clearing.')
+            cd.exp_band = nil
+            save_data()
+        end
+    end
+end
+
+-- ============================================================================
+-- EXP Band Alert Check
+-- ============================================================================
+-- Fires a chat notification when the stored band's cooldown expires.
+local function check_exp_band_alerts(char_name, is_login_check)
+    if not char_name then return end
+    if not settings.exp_band_tracking_enabled then return end
+    local cd = data[char_name]
+    if not cd or not cd.exp_band then return end
+
+    local band = cd.exp_band
+    if not band.expiry_time then return end
+
+    if os.time() >= band.expiry_time then
+        if not band.notified_ready then
+            band.notified_ready = true
+            save_data()
+            if is_login_check then
+                log(string.format('\30\08EXP Band READY:\30\01 %s can be used now.', band.name))
+            else
+                log(string.format('\30\08%s\30\01 is now READY to use!', band.name))
+            end
+        end
+    end
+end
+
+-- ============================================================================
 -- ENM / Limbus Alert Check
 -- ============================================================================
 -- Checks all ENM quests for the given character. If a cooldown has expired
@@ -1370,10 +1530,10 @@ local function render_ui()
         imgui.Separator()
 
         -- Collect character names sorted alphabetically, current char first
-        -- Filter out the _hidden key which is not a character
+        -- Filter out the _hidden / _settings keys which are not characters
         local char_names = {}
         for name, _ in pairs(data) do
-            if name ~= '_hidden' then
+            if name ~= '_hidden' and name ~= '_settings' then
                 char_names[#char_names + 1] = name
             end
         end
@@ -1640,6 +1800,63 @@ local function render_ui()
                     end
 
                     -- ==================================================
+                    -- EXP BAND SECTION (collapsible)
+                    -- ==================================================
+                    if settings.exp_band_tracking_enabled and not is_quest_hidden('EXP Band') then
+                        imgui.Spacing()
+                        if imgui.CollapsingHeader('EXP Band', ImGuiTreeNodeFlags_DefaultOpen) then
+                            local band = cd.exp_band
+
+                            imgui.Columns(4, '##expBandCols', true)
+                            imgui.SetColumnWidth(0, 30)
+                            imgui.SetColumnWidth(1, 140)
+                            imgui.SetColumnWidth(2, 80)
+                            imgui.Text('')
+                            imgui.NextColumn()
+                            imgui.Text('Band')
+                            imgui.NextColumn()
+                            imgui.Text('Charges')
+                            imgui.NextColumn()
+                            imgui.Text('Status')
+                            imgui.NextColumn()
+                            imgui.Separator()
+
+                            -- Hide button
+                            imgui.PushID('hide_expband')
+                            if imgui.SmallButton('x') then
+                                set_quest_hidden('EXP Band', true)
+                                save_data()
+                            end
+                            imgui.PopID()
+                            imgui.NextColumn()
+
+                            if band then
+                                imgui.Text(band.name or '?')
+                                imgui.NextColumn()
+                                imgui.Text(tostring(band.charges or 0))
+                                imgui.NextColumn()
+                                local now_ts = os.time()
+                                if not band.expiry_time or band.expiry_time <= now_ts then
+                                    imgui.TextColored(KI_COLOR_YES, 'READY')
+                                else
+                                    imgui.TextColored(STATUS_COLORS['NEED TO COMPLETE'],
+                                        format_countdown(band.expiry_time - now_ts))
+                                end
+                                imgui.NextColumn()
+                            else
+                                imgui.TextColored(KI_COLOR_DIM, 'None')
+                                imgui.NextColumn()
+                                imgui.TextColored(KI_COLOR_DIM, '-')
+                                imgui.NextColumn()
+                                imgui.TextColored(KI_COLOR_DIM, '-')
+                                imgui.NextColumn()
+                            end
+
+                            imgui.Columns(1)
+                        end
+                    end
+
+                    -- ==================================================
                     -- DYNAMIS SECTION (collapsible)
                     -- ==================================================
                     if not is_quest_hidden('Dynamis') then
@@ -1714,6 +1931,26 @@ local function render_ui()
             if imgui.BeginTabItem('Config') then
 
                 -- ----------------------------------------------------------
+                -- Feature toggles
+                -- ----------------------------------------------------------
+                imgui.TextColored({ 1.0, 1.0, 0.6, 1.0 }, 'Features')
+                imgui.Separator()
+
+                local exp_band_toggle = { settings.exp_band_tracking_enabled and true or false }
+                if imgui.Checkbox('Track EXP Bands (Chariot/Empress/Emperor)', exp_band_toggle) then
+                    settings.exp_band_tracking_enabled = exp_band_toggle[1]
+                    log(string.format('EXP Band tracking: %s',
+                        settings.exp_band_tracking_enabled and 'ENABLED' or 'DISABLED'))
+                    save_data()
+                    -- Re-scan immediately if just enabled
+                    if settings.exp_band_tracking_enabled then
+                        local cur = get_current_char_name()
+                        if cur then scan_exp_band_for_char(cur) end
+                    end
+                end
+                imgui.Spacing()
+
+                -- ----------------------------------------------------------
                 -- Hidden Quests
                 -- ----------------------------------------------------------
                 imgui.TextColored({ 1.0, 1.0, 0.6, 1.0 }, 'Hidden Quests')
@@ -1781,6 +2018,19 @@ local function render_ui()
                     imgui.Text('[Dynamis] Dynamis (entire section)')
                 end
 
+                -- EXP Band section
+                if is_quest_hidden('EXP Band') then
+                    any_hidden = true
+                    imgui.PushID('show_expband_section')
+                    if imgui.SmallButton('Show') then
+                        set_quest_hidden('EXP Band', false)
+                        save_data()
+                    end
+                    imgui.PopID()
+                    imgui.SameLine()
+                    imgui.Text('[EXP Band] EXP Band (entire section)')
+                end
+
                 if not any_hidden then
                     imgui.TextColored({ 0.5, 0.5, 0.5, 1.0 }, 'No hidden quests.')
                 end
@@ -1799,7 +2049,7 @@ local function render_ui()
                 -- Build character list
                 local override_chars = {}
                 for cname, cdata in pairs(data) do
-                    if cname ~= '_hidden' and type(cdata) == 'table' then
+                    if cname ~= '_hidden' and cname ~= '_settings' and type(cdata) == 'table' then
                         override_chars[#override_chars + 1] = cname
                     end
                 end
@@ -2143,6 +2393,7 @@ ashita.events.register('command', 'weeklier_command_cb', function(e)
         data = {}
         hidden_quests = {}
         data._hidden = hidden_quests
+        data._settings = settings
         save_data()
         log('All character data cleared.')
         return
@@ -2685,6 +2936,13 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e
     local zone_id = u32le(pkt, 0x30 + 1)
     local zone_name = DYNAMIS_ZONES[zone_id]
 
+    -- Scan inventory for an EXP band on every zone-in (regardless of zone type).
+    -- Inventory is reliably populated by the time 0x00A arrives for zone changes.
+    do
+        local cur = get_current_char_name()
+        if cur then scan_exp_band_for_char(cur) end
+    end
+
     -- Zoning into a non-Dynamis zone: clear active session
     if not zone_name then
         if dynamis_active_session then
@@ -2772,6 +3030,18 @@ ashita.events.register('d3d_present', 'weeklier_present_cb', function()
         if (now_ts - enm_alert_last_check) >= ENM_ALERT_CHECK_INTERVAL then
             enm_alert_last_check = now_ts
             check_enm_alerts(name, false)
+        end
+
+        -- EXP Band: one-time login scan + alert check
+        if settings.exp_band_tracking_enabled and not exp_band_alert_login_done[name] then
+            exp_band_alert_login_done[name] = true
+            scan_exp_band_for_char(name)
+            check_exp_band_alerts(name, true)
+        end
+
+        -- EXP Band: periodic alert check (piggybacks on the ENM interval)
+        if settings.exp_band_tracking_enabled then
+            check_exp_band_alerts(name, false)
         end
     end
 
