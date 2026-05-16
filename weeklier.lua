@@ -4,7 +4,7 @@ local imgui = require('imgui')
 
 addon.name    = 'weeklier'
 addon.author  = 'Pathead'
-addon.version = '0.6a'
+addon.version = '1.0'
 addon.desc    = 'Tracks weekly quest completion across characters.'
 addon.link    = 'https://github.com/patheed-ffxi/weeklier'
 
