@@ -4,7 +4,7 @@ local imgui = require('imgui')
 
 addon.name    = 'weeklier'
 addon.author  = 'Pathead'
-addon.version = '1.0'
+addon.version = '1.1'
 addon.desc    = 'Tracks weekly quest completion across characters.'
 addon.link    = 'https://github.com/patheed-ffxi/weeklier'
 
@@ -1367,8 +1367,13 @@ end
 -- For the first one found with at least 1 charge remaining, reads the
 -- next-use timestamp from item.Extra (bytes 5..8 = LE uint32 vana-relative)
 -- and stores it on the character record.
--- If none are found (or none have charges), the stored band is cleared.
-local function scan_exp_band_for_char(char_name)
+-- If allow_clear is true and none are found, the stored band is cleared.
+-- If allow_clear is false (set-only mode), a missing band is ignored: this
+-- is used during the post-zone polling window because individual bags
+-- populate at different times and a partial-load scan would falsely "lose"
+-- a band that's actually still in an unloaded wardrobe.
+local function scan_exp_band_for_char(char_name, allow_clear)
+    if allow_clear == nil then allow_clear = true end
     if not char_name then return end
     if not settings.exp_band_tracking_enabled then return end
 
@@ -1404,28 +1409,35 @@ local function scan_exp_band_for_char(char_name)
     local prev = cd.exp_band
     if found then
         -- Preserve notified_ready state if same band & same expiry, else reset.
+        local same_as_prev = prev
+            and prev.item_id     == found.item_id
+            and prev.expiry_time == found.expiry_time
+            and prev.charges     == found.charges
         if prev and prev.item_id == found.item_id and prev.expiry_time == found.expiry_time then
             found.notified_ready = prev.notified_ready
         end
         cd.exp_band = found
-        local now = os.time()
-        if found.expiry_time <= now then
-            log(string.format('EXP Band found: %s (%d charge%s) - READY now.',
-                found.name, found.charges, found.charges == 1 and '' or 's'))
-        else
-            log(string.format('EXP Band found: %s (%d charge%s) - ready in %s.',
-                found.name, found.charges, found.charges == 1 and '' or 's',
-                format_countdown(found.expiry_time - now)))
+        if not same_as_prev then
+            local now = os.time()
+            if found.expiry_time <= now then
+                log(string.format('EXP Band found: %s (%d charge%s) - READY now.',
+                    found.name, found.charges, found.charges == 1 and '' or 's'))
+            else
+                log(string.format('EXP Band found: %s (%d charge%s) - ready in %s.',
+                    found.name, found.charges, found.charges == 1 and '' or 's',
+                    format_countdown(found.expiry_time - now)))
+            end
+            save_data()
         end
-        save_data()
     else
-        if prev then
+        if prev and allow_clear then
             log('EXP Band no longer in inventory (or out of charges) - clearing.')
             cd.exp_band = nil
             save_data()
         end
     end
 end
+
 
 -- ============================================================================
 -- EXP Band Alert Check
@@ -2936,12 +2948,9 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e
     local zone_id = u32le(pkt, 0x30 + 1)
     local zone_name = DYNAMIS_ZONES[zone_id]
 
-    -- Scan inventory for an EXP band on every zone-in (regardless of zone type).
-    -- Inventory is reliably populated by the time 0x00A arrives for zone changes.
-    do
-        local cur = get_current_char_name()
-        if cur then scan_exp_band_for_char(cur) end
-    end
+    -- (EXP band scanning on zone-in is handled by the 0x01D Inventory Finish
+    --  packet handler, which fires once the post-zone inventory burst is
+    --  complete. No action needed here.)
 
     -- Zoning into a non-Dynamis zone: clear active session
     if not zone_name then
@@ -3005,6 +3014,92 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e
         last_update = os.time(),
     }
     dlog(string.format('Initialized Dynamis session: %s (placeholder expiry in 120s).', zone_name))
+end)
+
+-- ============================================================================
+-- Inventory Item Packet (0x020) - EXP Band detection
+-- ============================================================================
+-- The server sends 0x020 (Inventory Item) per item slot to deliver full item
+-- info, including the 24-byte Extra buffer that holds the band's charges and
+-- next-use timestamp. It fires:
+--   - For every item in every bag during the post-zone inventory burst.
+--   - When a new item is obtained (e.g. ENM band drop).
+--   - When an item changes state (charges consumed, timer updated).
+--   - With count=0 to signal a slot was cleared.
+-- Filtering by item id up-front keeps this cheap even though it fires per
+-- item: the body only runs when one of the 3 EXP band IDs comes through.
+--
+-- Packet 0x020 layout (1-based offsets):
+--   [05..08] u32  count
+--   [09..12] u32  bazaar price
+--   [13]     u8   bag id
+--   [14]     u8   slot
+--   [15..16] u16  item id
+--   [17]     u8   status / flag
+--   [18..41] 24B  Extra
+ashita.events.register('packet_in', 'weeklier_packet_in_cb_020_item', function(e)
+    if e.id ~= 0x020 then return end
+    if not settings.exp_band_tracking_enabled then return end
+    if not e.data or #e.data < 41 then return end
+
+    local item_id = u16le(e.data, 15)
+    local band_name = EXP_BANDS[item_id]
+    if not band_name then return end
+
+    local cur = get_current_char_name()
+    if not cur then return end
+    local cd = ensure_char(cur)
+    if not cd then return end
+
+    local count = u32le(e.data, 5)
+    local extra = string.sub(e.data, 18, 41)    -- 24 bytes
+    local charges = string.byte(extra, 2) or 0
+
+    -- Slot cleared, item gone, or out of charges: treat as removal, but only
+    -- if the stored band matches this item (don't wipe a different band that
+    -- might be in another slot).
+    if count == 0 or charges < 1 then
+        if cd.exp_band and cd.exp_band.item_id == item_id then
+            log(string.format('EXP Band removed/depleted: %s - clearing.', band_name))
+            cd.exp_band = nil
+            save_data()
+        end
+        return
+    end
+
+    local extra_ts = u32le(extra, 5)
+    local expiry   = extra_ts + VANA_OFFSET
+
+    local prev = cd.exp_band
+    local found = {
+        item_id     = item_id,
+        name        = band_name,
+        expiry_time = expiry,
+        charges     = charges,
+    }
+    -- Preserve notified_ready if nothing material changed.
+    local same_as_prev = prev
+        and prev.item_id     == found.item_id
+        and prev.expiry_time == found.expiry_time
+        and prev.charges     == found.charges
+    if prev and prev.item_id == found.item_id and prev.expiry_time == found.expiry_time then
+        found.notified_ready = prev.notified_ready
+    end
+    cd.exp_band = found
+    if not same_as_prev then
+        local now = os.time()
+        if expiry <= now then
+            log(string.format('EXP Band found: %s (%d charge%s) - READY now.',
+                band_name, charges, charges == 1 and '' or 's'))
+        else
+            log(string.format('EXP Band found: %s (%d charge%s) - ready in %s.',
+                band_name, charges, charges == 1 and '' or 's',
+                format_countdown(expiry - now)))
+        end
+        save_data()
+    end
+
+    check_exp_band_alerts(cur, false)
 end)
 
 -- ============================================================================
