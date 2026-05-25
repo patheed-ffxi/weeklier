@@ -1,6 +1,7 @@
 # Weeklier
 
 An [Ashita v4](https://www.ashitaxi.com/) addon for [HorizonXI](https://horizonxi.com/) that tracks weekly quest completion across all of your characters.
+Now officially approved for use! (may not appear on the approved addon list yet)
 
 ## Features
 
