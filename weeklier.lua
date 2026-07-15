@@ -83,14 +83,21 @@ end
 -- Status is derived from live packet data for the current character and
 -- persisted to JSON so it can be viewed when logged into a different character.
 --
--- For ENM / Limbus quests (type = 'enm'):
+-- For ENM / Limbus / other cooldown-based rewards (type = 'enm'):
 --   ki_quest_active     : KI name (from key_item.lua) used to verify possession via packet.
 --   ki_display_name     : The human-readable KI name as it appears in the chat message
 --                         "Obtained key item: <ki_display_name>."  Used to detect when the
 --                         KI was obtained and start the cooldown timer.
---   enm_cooldown_days   : Number of real days for the cooldown (default 5 for ENMs, 3 for Limbus).
---   ENMs / Limbus are displayed in their own section in the UI, separate from weekly quests.
---   Cooldown data is NOT reset on weekly rollover - it uses its own timer.
+--   obtain_phrase       : Alternative to ki_quest_active/ki_display_name for cooldown
+--                         rewards that are regular items rather than key items (e.g.
+--                         HAAP pages). Full chat phrase that marks the reward being
+--                         received, matched after normalizing
+--                         (e.g. "Obtained: Page from the Dragon Chronicles").
+--   enm_cooldown_days   : Number of real days for the cooldown (default 5 for ENMs,
+--                         3 for Limbus, 1 for HAAP pages).
+--   These are displayed in their own cooldown section in the UI, separate from
+--   weekly quests. Cooldown data is NOT reset on weekly rollover - it uses its
+--   own timer.
 --
 -- For kill-based quests (type = 'kill_mob'):
 --   kill_mob            : mob name to watch for in "defeats the <mob>" messages
@@ -211,6 +218,23 @@ local QUESTS = {
         ki_quest_active     = 'CENSER_OF_ACRIMONY',
         ki_display_name     = 'Censer of Acrimony',
         enm_cooldown_days   = 5,
+    },
+    -- -----------------------------------------------------------------------
+    -- HAAP point exchanges: EXP pages are regular items (not key items)
+    -- handed out by the HAAP NPC, each on its own independent 24h cooldown.
+    -- Detected via the "Obtained: <item>" chat line when the exchange happens.
+    -- -----------------------------------------------------------------------
+    {
+        name                = "HAAP - Miratete's Memoirs",
+        type                = 'enm',
+        obtain_phrase       = "Obtained: Page from Miratete's Memoirs",
+        enm_cooldown_days   = 1,
+    },
+    {
+        name                = 'HAAP - Dragon Chronicles',
+        type                = 'enm',
+        obtain_phrase       = 'Obtained: Page from the Dragon Chronicles',
+        enm_cooldown_days   = 1,
     },
     -- -----------------------------------------------------------------------
     -- Kill-based quest: no flag or turn-in, just kill the mob and get XP.
@@ -1578,12 +1602,12 @@ local function check_enm_alerts(char_name, is_login_check)
         save_data()
         if is_login_check then
             -- Single summary message on login
-            log(string.format('\30\08%d ENM/Limbus key item(s) READY:\30\01 %s',
+            log(string.format('\30\08%d cooldown reward(s) READY:\30\01 %s',
                 #ready_names, table.concat(ready_names, ', ')))
         else
-            -- Individual alert per newly-ready ENM during play
+            -- Individual alert per newly-ready reward during play
             for _, rn in ipairs(ready_names) do
-                log(string.format('\30\08%s\30\01 is now READY! Key item can be obtained.', rn))
+                log(string.format('\30\08%s\30\01 is now READY!', rn))
             end
         end
     end
@@ -1800,7 +1824,7 @@ local function render_ui()
                     -- ==================================================
                     if #enm_quests > 0 then
                         imgui.Spacing()
-                        if imgui.CollapsingHeader('ENM / Limbus (Cooldown-Based)', ImGuiTreeNodeFlags_DefaultOpen) then
+                        if imgui.CollapsingHeader('Cooldowns (ENM / Limbus / HAAP)', ImGuiTreeNodeFlags_DefaultOpen) then
 
                             imgui.Columns(6, '##enmCols', true)
                             imgui.SetColumnWidth(0, 30)
@@ -1855,9 +1879,12 @@ local function render_ui()
                                         imgui.Text('-')
                                     end
                                 else
-                                    -- Use stored has_ki from JSON
+                                    -- Use stored has_ki from JSON ('-' for
+                                    -- item-based rewards with no KI to track)
                                     local stored_ki = enm_data.has_ki
-                                    if stored_ki == true then
+                                    if not (q.ki_quest_active and q.ki_quest_active ~= '') then
+                                        imgui.Text('-')
+                                    elseif stored_ki == true then
                                         imgui.TextColored(KI_COLOR_YES, 'Yes')
                                     elseif stored_ki == false then
                                         imgui.TextColored(KI_COLOR_NO, 'No')
@@ -2195,14 +2222,16 @@ local function render_ui()
 
                         -- ---- ENMs / Limbus ----
                         imgui.Spacing()
-                        if imgui.CollapsingHeader('Override: ENM / Limbus##ovr_enm') then
+                        if imgui.CollapsingHeader('Override: Cooldowns (ENM / Limbus / HAAP)##ovr_enm') then
                             for _, q in ipairs(QUESTS) do
                                 if q.type == 'enm' then
                                     if not ocd.enms then ocd.enms = {} end
                                     if not ocd.enms[q.name] then ocd.enms[q.name] = {} end
                                     local enm = ocd.enms[q.name]
 
-                                    local ki_str = enm.has_ki and 'Yes' or 'No'
+                                    -- Item-based rewards (obtain_phrase) have no KI to toggle
+                                    local has_ki_field = q.ki_quest_active and q.ki_quest_active ~= ''
+                                    local ki_str = has_ki_field and (enm.has_ki and 'Yes' or 'No') or '-'
                                     local obt_str = enm.ki_obtained_time and format_time(enm.ki_obtained_time) or 'Never'
                                     local _, _, ready_str = get_enm_status(enm, q)
 
@@ -2210,15 +2239,17 @@ local function render_ui()
                                         q.name, ki_str, obt_str, ready_str))
                                     imgui.SameLine()
 
-                                    imgui.PushID('ovr_enm_ki_' .. q.name)
-                                    if imgui.SmallButton(enm.has_ki and 'Remove KI' or 'Give KI') then
-                                        enm.has_ki = not enm.has_ki
-                                        log(string.format('Manual override: %s [%s] has_ki -> %s',
-                                            q.name, override_selected_char, tostring(enm.has_ki)))
-                                        save_data()
+                                    if has_ki_field then
+                                        imgui.PushID('ovr_enm_ki_' .. q.name)
+                                        if imgui.SmallButton(enm.has_ki and 'Remove KI' or 'Give KI') then
+                                            enm.has_ki = not enm.has_ki
+                                            log(string.format('Manual override: %s [%s] has_ki -> %s',
+                                                q.name, override_selected_char, tostring(enm.has_ki)))
+                                            save_data()
+                                        end
+                                        imgui.PopID()
+                                        imgui.SameLine()
                                     end
-                                    imgui.PopID()
-                                    imgui.SameLine()
 
                                     imgui.PushID('ovr_enm_cdn_' .. q.name)
                                     if imgui.SmallButton('Start CD') then
@@ -2784,11 +2815,18 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
         end
 
         -- ==============================================================
-        -- ENM quest: detect "Obtained key item: <ki_display_name>."
+        -- ENM / cooldown quest: detect the reward being obtained.
+        -- KI rewards: "Obtained key item: <ki_display_name>."
+        -- Item rewards (e.g. HAAP pages): custom obtain_phrase.
         -- ==============================================================
-        if q.type == 'enm' and q.ki_display_name and q.ki_display_name ~= '' then
-            local ki_phrase = 'obtained key item: ' .. normalize_string(q.ki_display_name)
-            if string.find(msg, ki_phrase, 1, true) then
+        if q.type == 'enm' then
+            local obtain_phrase
+            if q.obtain_phrase and q.obtain_phrase ~= '' then
+                obtain_phrase = normalize_string(q.obtain_phrase)
+            elseif q.ki_display_name and q.ki_display_name ~= '' then
+                obtain_phrase = 'obtained key item: ' .. normalize_string(q.ki_display_name)
+            end
+            if obtain_phrase and string.find(msg, obtain_phrase, 1, true) then
                 local cd = ensure_char(name)
                 if cd then
                     if not cd.enms then cd.enms = {} end
@@ -2796,7 +2834,7 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
                     cd.enms[q.name].ki_obtained_time = os.time()
                     cd.enms[q.name].notified_ready = nil  -- clear alert flag so next expiry triggers a new notification
                     local cooldown = q.enm_cooldown_days or 5
-                    log(string.format('ENM KI obtained: %s - %d day cooldown started.', q.name, cooldown))
+                    log(string.format('%s obtained - %d day cooldown started.', q.name, cooldown))
                     save_data()
                 end
             end
