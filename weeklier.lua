@@ -83,14 +83,21 @@ end
 -- Status is derived from live packet data for the current character and
 -- persisted to JSON so it can be viewed when logged into a different character.
 --
--- For ENM / Limbus quests (type = 'enm'):
+-- For ENM / Limbus / other cooldown-based rewards (type = 'enm'):
 --   ki_quest_active     : KI name (from key_item.lua) used to verify possession via packet.
 --   ki_display_name     : The human-readable KI name as it appears in the chat message
 --                         "Obtained key item: <ki_display_name>."  Used to detect when the
 --                         KI was obtained and start the cooldown timer.
---   enm_cooldown_days   : Number of real days for the cooldown (default 5 for ENMs, 3 for Limbus).
---   ENMs / Limbus are displayed in their own section in the UI, separate from weekly quests.
---   Cooldown data is NOT reset on weekly rollover - it uses its own timer.
+--   obtain_phrase       : Alternative to ki_quest_active/ki_display_name for cooldown
+--                         rewards that are regular items rather than key items (e.g.
+--                         HAAP pages). Full chat phrase that marks the reward being
+--                         received, matched after normalizing
+--                         (e.g. "Obtained: Page from the Dragon Chronicles").
+--   enm_cooldown_days   : Number of real days for the cooldown (default 5 for ENMs,
+--                         3 for Limbus, 1 for HAAP pages).
+--   These are displayed in their own cooldown section in the UI, separate from
+--   weekly quests. Cooldown data is NOT reset on weekly rollover - it uses its
+--   own timer.
 --
 -- For kill-based quests (type = 'kill_mob'):
 --   kill_mob            : mob name to watch for in "defeats the <mob>" messages
@@ -99,8 +106,12 @@ end
 --   Kill detection works in two steps within a short time window:
 --     1. "Someone defeats the <kill_mob>." appears in chat
 --     2. "<your character> gains <x> experience points." appears shortly after
+--        ("limit points" also counts, for kills made in limit mode)
 --   Both must occur within KILL_CONFIRM_WINDOW seconds to count.
 --   Once confirmed, the quest goes straight to COMPLETED.
+--   Known limitations: the "defeats" line can come from any nearby player's
+--   kill, so an unrelated XP gain inside the window can confirm a kill you
+--   didn't make; kills that print no experience/limit message never confirm.
 -- ============================================================================
 
 -- How many seconds after a "defeats the X" message to wait for the XP message
@@ -207,6 +218,23 @@ local QUESTS = {
         ki_quest_active     = 'CENSER_OF_ACRIMONY',
         ki_display_name     = 'Censer of Acrimony',
         enm_cooldown_days   = 5,
+    },
+    -- -----------------------------------------------------------------------
+    -- HAAP point exchanges: EXP pages are regular items (not key items)
+    -- handed out by the HAAP NPC, each on its own independent 24h cooldown.
+    -- Detected via the "Obtained: <item>" chat line when the exchange happens.
+    -- -----------------------------------------------------------------------
+    {
+        name                = "HAAP - Miratete's Memoirs",
+        type                = 'enm',
+        obtain_phrase       = "Obtained: Page from Miratete's Memoirs",
+        enm_cooldown_days   = 1,
+    },
+    {
+        name                = 'HAAP - Dragon Chronicles',
+        type                = 'enm',
+        obtain_phrase       = 'Obtained: Page from the Dragon Chronicles',
+        enm_cooldown_days   = 1,
     },
     -- -----------------------------------------------------------------------
     -- Kill-based quest: no flag or turn-in, just kill the mob and get XP.
@@ -674,13 +702,21 @@ end
 -- ============================================================================
 local function save_data()
     if not save_path then return end
-    local f = io.open(save_path, 'w+')
+    -- Write to a temp file first, then swap it in, so a crash mid-write
+    -- can't truncate the existing save.
+    local tmp_path = save_path .. '.tmp'
+    local f = io.open(tmp_path, 'w+')
     if not f then
         log('Failed to open save file for writing.')
         return
     end
     f:write(json.encode(data))
     f:close()
+    os.remove(save_path)
+    local ok, err = os.rename(tmp_path, save_path)
+    if not ok then
+        log(string.format('Failed to finalize save file: %s', tostring(err)))
+    end
 end
 
 local function load_data()
@@ -696,7 +732,11 @@ local function load_data()
 
     local ok, decoded = pcall(json.decode, raw)
     if not ok or type(decoded) ~= 'table' then
-        log('Failed to parse save file; starting fresh.')
+        -- Keep the corrupt file around instead of silently overwriting it on
+        -- the next save, so the data can be recovered by hand if needed.
+        os.remove(save_path .. '.bad')
+        os.rename(save_path, save_path .. '.bad')
+        log('Failed to parse save file; starting fresh. (old file kept as char_data.json.bad)')
         data = {}
         data._settings = settings
         return
@@ -768,6 +808,10 @@ end
 -- ============================================================================
 -- Character Data Helpers
 -- ============================================================================
+-- Forward declaration (defined in the Eco Warrior Status Derivation section);
+-- needed by ensure_char's weekly rollover to refresh stale eco statuses.
+local derive_eco_statuses
+
 -- Ensures the character entry exists and is for the current week.
 -- On week rollover, only COMPLETED quests are reset (flagged/in-progress
 -- quests persist in-game and don't need to be re-accepted).
@@ -787,7 +831,9 @@ local function ensure_char(name)
 
     -- Week rollover - only reset COMPLETED quests (flagged/in-progress quests
     -- persist across the weekly boundary in-game and don't need to be re-flagged)
+    local week_rolled_over = false
     if data[name].week ~= week then
+        week_rolled_over = true
         log(string.format('New week detected for %s - resetting completed quests. (old=%s, new=%s)',
             name, data[name].week, week))
         data[name].week = week
@@ -868,6 +914,27 @@ local function ensure_char(name)
         -- If all_have_week, eco_cycle stays empty (full cycle complete, all available)
     end
 
+    -- On week rollover, refresh week-scoped eco warrior statuses. Without
+    -- this, a character that hasn't logged in since the reset keeps
+    -- displaying last week's 'Completed'/'Not Available' (the UI prefers
+    -- stored_status for non-current characters). Other statuses (Flagged
+    -- etc.) legitimately persist across the weekly boundary and are left
+    -- alone. Runs after the eco/eco_cycle blocks above so the derivation
+    -- sees fully migrated data.
+    if week_rolled_over then
+        local eco_statuses = derive_eco_statuses(data[name], false)
+        for _, ew in ipairs(ECO_WARRIORS) do
+            local eco = data[name].eco[ew.key]
+            if eco and (eco.stored_status == 'Completed' or eco.stored_status == 'Not Available') then
+                local r = eco_statuses[ew.key]
+                if r and eco.stored_status ~= r.status then
+                    log(string.format('  Reset Eco %s: %s -> %s', ew.nation, eco.stored_status, r.status))
+                    eco.stored_status = r.status
+                end
+            end
+        end
+    end
+
     -- Ensure dynamis tracking table exists
     if not data[name].dynamis then
         data[name].dynamis = {}
@@ -905,6 +972,10 @@ end
 -- clears stale packet state. Call this at the top of packet handlers.
 -- Returns true if a character change was detected (callers may want to skip
 -- processing the current packet to avoid acting on stale data).
+-- KNOWN LIMITATION: this relies on party memory updating before the new
+-- character's packets arrive. If an early packet is processed while memory
+-- still returns the previous character's name, the change is undetectable
+-- here and that packet's effects may be attributed to the previous character.
 local function check_packet_char_change()
     local name = get_current_char_name()
     if not name then return false end
@@ -917,6 +988,27 @@ local function check_packet_char_change()
     end
     last_packet_char = name
     return false
+end
+
+-- Persist the in-memory Dynamis session to the current character's record so
+-- it survives a crash/relog inside Dynamis. Without this, re-entering after a
+-- client restart would be counted as a second weekly entrance (the 0x00A
+-- handler restores the session from cd.dynamis_session before counting).
+local function persist_dynamis_session()
+    local name = get_current_char_name()
+    if not name then return end
+    local cd = ensure_char(name)
+    if not cd then return end
+    if dynamis_active_session then
+        cd.dynamis_session = {
+            zone_id     = dynamis_active_session.zone_id,
+            zone_name   = dynamis_active_session.zone_name,
+            expiry_time = dynamis_active_session.expiry_time,
+        }
+    else
+        cd.dynamis_session = nil
+    end
+    save_data()
 end
 
 -- ============================================================================
@@ -1194,7 +1286,7 @@ end
 --      When all nations are completed, eco_cycle is cleared and all become available.
 --   7. Otherwise -> 'Available'
 --
-local function derive_eco_statuses(cd, is_current_char)
+function derive_eco_statuses(cd, is_current_char)
     local week = get_week_key()
     local results = {}
     local any_flagged_this_week = false
@@ -1368,10 +1460,13 @@ end
 -- next-use timestamp from item.Extra (bytes 5..8 = LE uint32 vana-relative)
 -- and stores it on the character record.
 -- If allow_clear is true and none are found, the stored band is cleared.
+-- Full scans (allow_clear=true) run from the 0x01D Inventory Finish handler
+-- (bags fully populated) and from the config-tab toggle.
 -- If allow_clear is false (set-only mode), a missing band is ignored: this
--- is used during the post-zone polling window because individual bags
--- populate at different times and a partial-load scan would falsely "lose"
--- a band that's actually still in an unloaded wardrobe.
+-- is used for the one-time login scan from d3d_present, which can run before
+-- the login inventory burst finishes - individual bags populate at different
+-- times and a partial-load scan would falsely "lose" a band that's actually
+-- still in an unloaded wardrobe.
 local function scan_exp_band_for_char(char_name, allow_clear)
     if allow_clear == nil then allow_clear = true end
     if not char_name then return end
@@ -1507,12 +1602,12 @@ local function check_enm_alerts(char_name, is_login_check)
         save_data()
         if is_login_check then
             -- Single summary message on login
-            log(string.format('\30\08%d ENM/Limbus key item(s) READY:\30\01 %s',
+            log(string.format('\30\08%d cooldown reward(s) READY:\30\01 %s',
                 #ready_names, table.concat(ready_names, ', ')))
         else
-            -- Individual alert per newly-ready ENM during play
+            -- Individual alert per newly-ready reward during play
             for _, rn in ipairs(ready_names) do
-                log(string.format('\30\08%s\30\01 is now READY! Key item can be obtained.', rn))
+                log(string.format('\30\08%s\30\01 is now READY!', rn))
             end
         end
     end
@@ -1576,7 +1671,9 @@ local function render_ui()
             -- Character tabs
             -- ==========================================================
             for _, char_name in ipairs(char_names) do
-                local cd = data[char_name]
+                -- ensure_char (not a raw data read) so weekly rollover resets
+                -- apply to characters that haven't logged in since the reset.
+                local cd = ensure_char(char_name)
                 local tab_flags = 0
                 if select_current_tab and char_name == current_char then
                     tab_flags = ImGuiTabItemFlags_SetSelected
@@ -1727,7 +1824,7 @@ local function render_ui()
                     -- ==================================================
                     if #enm_quests > 0 then
                         imgui.Spacing()
-                        if imgui.CollapsingHeader('ENM / Limbus (Cooldown-Based)', ImGuiTreeNodeFlags_DefaultOpen) then
+                        if imgui.CollapsingHeader('Cooldowns (ENM / Limbus / HAAP)', ImGuiTreeNodeFlags_DefaultOpen) then
 
                             imgui.Columns(6, '##enmCols', true)
                             imgui.SetColumnWidth(0, 30)
@@ -1782,9 +1879,12 @@ local function render_ui()
                                         imgui.Text('-')
                                     end
                                 else
-                                    -- Use stored has_ki from JSON
+                                    -- Use stored has_ki from JSON ('-' for
+                                    -- item-based rewards with no KI to track)
                                     local stored_ki = enm_data.has_ki
-                                    if stored_ki == true then
+                                    if not (q.ki_quest_active and q.ki_quest_active ~= '') then
+                                        imgui.Text('-')
+                                    elseif stored_ki == true then
                                         imgui.TextColored(KI_COLOR_YES, 'Yes')
                                     elseif stored_ki == false then
                                         imgui.TextColored(KI_COLOR_NO, 'No')
@@ -2122,14 +2222,16 @@ local function render_ui()
 
                         -- ---- ENMs / Limbus ----
                         imgui.Spacing()
-                        if imgui.CollapsingHeader('Override: ENM / Limbus##ovr_enm') then
+                        if imgui.CollapsingHeader('Override: Cooldowns (ENM / Limbus / HAAP)##ovr_enm') then
                             for _, q in ipairs(QUESTS) do
                                 if q.type == 'enm' then
                                     if not ocd.enms then ocd.enms = {} end
                                     if not ocd.enms[q.name] then ocd.enms[q.name] = {} end
                                     local enm = ocd.enms[q.name]
 
-                                    local ki_str = enm.has_ki and 'Yes' or 'No'
+                                    -- Item-based rewards (obtain_phrase) have no KI to toggle
+                                    local has_ki_field = q.ki_quest_active and q.ki_quest_active ~= ''
+                                    local ki_str = has_ki_field and (enm.has_ki and 'Yes' or 'No') or '-'
                                     local obt_str = enm.ki_obtained_time and format_time(enm.ki_obtained_time) or 'Never'
                                     local _, _, ready_str = get_enm_status(enm, q)
 
@@ -2137,15 +2239,17 @@ local function render_ui()
                                         q.name, ki_str, obt_str, ready_str))
                                     imgui.SameLine()
 
-                                    imgui.PushID('ovr_enm_ki_' .. q.name)
-                                    if imgui.SmallButton(enm.has_ki and 'Remove KI' or 'Give KI') then
-                                        enm.has_ki = not enm.has_ki
-                                        log(string.format('Manual override: %s [%s] has_ki -> %s',
-                                            q.name, override_selected_char, tostring(enm.has_ki)))
-                                        save_data()
+                                    if has_ki_field then
+                                        imgui.PushID('ovr_enm_ki_' .. q.name)
+                                        if imgui.SmallButton(enm.has_ki and 'Remove KI' or 'Give KI') then
+                                            enm.has_ki = not enm.has_ki
+                                            log(string.format('Manual override: %s [%s] has_ki -> %s',
+                                                q.name, override_selected_char, tostring(enm.has_ki)))
+                                            save_data()
+                                        end
+                                        imgui.PopID()
+                                        imgui.SameLine()
                                     end
-                                    imgui.PopID()
-                                    imgui.SameLine()
 
                                     imgui.PushID('ovr_enm_cdn_' .. q.name)
                                     if imgui.SmallButton('Start CD') then
@@ -2343,6 +2447,14 @@ ashita.events.register('load', 'weeklier_load_cb', function()
     save_path = string.format('%s/char_data.json', addon.path)
     build_ki_lookup()
     load_data()
+    -- Normalize every stored character so weekly rollover resets apply even
+    -- to characters that haven't logged in since the reset.
+    for cname, cdata in pairs(data) do
+        if cname ~= '_hidden' and cname ~= '_settings' and type(cdata) == 'table' then
+            ensure_char(cname)
+        end
+    end
+    save_data()
     log('Loaded. Use /weeklier show to open the tracker.')
 end)
 
@@ -2576,6 +2688,7 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
             end
             dlog(string.format('Dynamis session expiry set: %s (in %d minutes, epoch=%d).',
                 dynamis_active_session.zone_name, minutes, expiry))
+            persist_dynamis_session()
         end
     end
 
@@ -2601,6 +2714,7 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
                     last_update = now_ts,
                 }
             end
+            persist_dynamis_session()
         end
     end
 
@@ -2643,8 +2757,10 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
     -- Pattern: "<charname> gains 1234 experience points."
     -- ------------------------------------------------------------------
     if next(pending_kills) then
-        local xp_pattern = normalize_string(name) .. ' gains %d+ experience points'
-        if string.find(msg, xp_pattern) then
+        -- "limit points" also counts, for kills made in limit mode.
+        local who = normalize_string(name)
+        if string.find(msg, who .. ' gains %d+ experience points')
+           or string.find(msg, who .. ' gains %d+ limit points') then
             dlog(string.format('XP message matched: "%s"', msg))
             -- Confirm every pending kill that is still within the window
             for qi, ts in pairs(pending_kills) do
@@ -2699,11 +2815,18 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
         end
 
         -- ==============================================================
-        -- ENM quest: detect "Obtained key item: <ki_display_name>."
+        -- ENM / cooldown quest: detect the reward being obtained.
+        -- KI rewards: "Obtained key item: <ki_display_name>."
+        -- Item rewards (e.g. HAAP pages): custom obtain_phrase.
         -- ==============================================================
-        if q.type == 'enm' and q.ki_display_name and q.ki_display_name ~= '' then
-            local ki_phrase = 'obtained key item: ' .. normalize_string(q.ki_display_name)
-            if string.find(msg, ki_phrase, 1, true) then
+        if q.type == 'enm' then
+            local obtain_phrase
+            if q.obtain_phrase and q.obtain_phrase ~= '' then
+                obtain_phrase = normalize_string(q.obtain_phrase)
+            elseif q.ki_display_name and q.ki_display_name ~= '' then
+                obtain_phrase = 'obtained key item: ' .. normalize_string(q.ki_display_name)
+            end
+            if obtain_phrase and string.find(msg, obtain_phrase, 1, true) then
                 local cd = ensure_char(name)
                 if cd then
                     if not cd.enms then cd.enms = {} end
@@ -2711,7 +2834,7 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
                     cd.enms[q.name].ki_obtained_time = os.time()
                     cd.enms[q.name].notified_ready = nil  -- clear alert flag so next expiry triggers a new notification
                     local cooldown = q.enm_cooldown_days or 5
-                    log(string.format('ENM KI obtained: %s - %d day cooldown started.', q.name, cooldown))
+                    log(string.format('%s obtained - %d day cooldown started.', q.name, cooldown))
                     save_data()
                 end
             end
@@ -2968,6 +3091,30 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e
     -- Dynamis zone detected
     dlog(string.format('0x00A zone-in: %s (id=%d)', zone_name, zone_id))
 
+    -- No in-memory session: try restoring a persisted one. The in-memory
+    -- session is lost when the client crashes or the player relogs inside
+    -- Dynamis - without this, the re-entry would count as a second weekly
+    -- entrance.
+    if not is_dynamis_session_active() then
+        local rname = get_current_char_name()
+        local saved = rname and data[rname] and data[rname].dynamis_session or nil
+        if saved and saved.expiry_time then
+            if saved.expiry_time > os.time() then
+                dynamis_active_session = {
+                    zone_id     = saved.zone_id or zone_id,
+                    zone_name   = saved.zone_name or zone_name,
+                    expiry_time = saved.expiry_time,
+                    last_update = os.time(),
+                }
+                log(string.format('Restored Dynamis session from save (%s, ~%d min left) - treating zone-in as re-entry.',
+                    dynamis_active_session.zone_name,
+                    math.ceil((saved.expiry_time - os.time()) / 60)))
+            else
+                data[rname].dynamis_session = nil
+            end
+        end
+    end
+
     -- Check if there is an active Dynamis session (timer still running).
     -- If so, this is a re-entry (e.g. d/c or voluntary zone-out) - don't count it.
     if is_dynamis_session_active() then
@@ -2978,6 +3125,7 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e
         -- (shouldn't normally happen, but be safe)
         dynamis_active_session.zone_id = zone_id
         dynamis_active_session.zone_name = zone_name
+        persist_dynamis_session()
         return
     end
 
@@ -3013,7 +3161,24 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e
         expiry_time = os.time() + 120,  -- 2 min placeholder until time chat message arrives
         last_update = os.time(),
     }
+    persist_dynamis_session()
     dlog(string.format('Initialized Dynamis session: %s (placeholder expiry in 120s).', zone_name))
+end)
+
+-- ============================================================================
+-- Inventory Finish Packet (0x01D) - authoritative EXP band scan
+-- ============================================================================
+-- Sent by the server once the post-zone inventory burst is complete, so all
+-- bags are fully populated. This is the only scan allowed to clear a stored
+-- band (allow_clear = true); the earlier login scan from d3d_present is
+-- set-only because it can run mid-burst.
+ashita.events.register('packet_in', 'weeklier_packet_in_cb_01D_inv_finish', function(e)
+    if e.id ~= 0x01D then return end
+    if not settings.exp_band_tracking_enabled then return end
+
+    local name = get_current_char_name()
+    if not name then return end
+    scan_exp_band_for_char(name, true)
 end)
 
 -- ============================================================================
@@ -3045,6 +3210,12 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_020_item', function(e
     local item_id = u16le(e.data, 15)
     local band_name = EXP_BANDS[item_id]
     if not band_name then return end
+
+    -- Only track bands in bags they can actually be used from. A band parked
+    -- in e.g. Mog Safe would otherwise be recorded here and then cleared by
+    -- the memory scan (which only checks these bags), flip-flopping the state.
+    local bag_id = string.byte(e.data, 13)
+    if not EXP_BAND_BAG_NAMES[bag_id] then return end
 
     local cur = get_current_char_name()
     if not cur then return end
@@ -3125,18 +3296,20 @@ ashita.events.register('d3d_present', 'weeklier_present_cb', function()
         if (now_ts - enm_alert_last_check) >= ENM_ALERT_CHECK_INTERVAL then
             enm_alert_last_check = now_ts
             check_enm_alerts(name, false)
+            -- EXP Band: periodic alert check (same interval)
+            if settings.exp_band_tracking_enabled then
+                check_exp_band_alerts(name, false)
+            end
         end
 
-        -- EXP Band: one-time login scan + alert check
+        -- EXP Band: one-time login scan + alert check. Set-only scan
+        -- (allow_clear=false): bags may not be fully populated this early
+        -- after login; the authoritative full scan runs from the 0x01D
+        -- Inventory Finish handler once the burst completes.
         if settings.exp_band_tracking_enabled and not exp_band_alert_login_done[name] then
             exp_band_alert_login_done[name] = true
-            scan_exp_band_for_char(name)
+            scan_exp_band_for_char(name, false)
             check_exp_band_alerts(name, true)
-        end
-
-        -- EXP Band: periodic alert check (piggybacks on the ENM interval)
-        if settings.exp_band_tracking_enabled then
-            check_exp_band_alerts(name, false)
         end
     end
 
