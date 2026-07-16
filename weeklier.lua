@@ -100,18 +100,26 @@ end
 --   own timer.
 --
 -- For kill-based quests (type = 'kill_mob'):
---   kill_mob            : mob name to watch for in "defeats the <mob>" messages
+--   kill_mob            : name of the mob whose death should complete the quest
 --   No flag/complete phrases needed - killing the mob IS the quest.
 --
---   Kill detection works in two steps within a short time window:
---     1. "Someone defeats the <kill_mob>." appears in chat
+--   Primary detection is packet-based (0x029 battle message): when the death
+--   message for <kill_mob> arrives, the killing actor is checked against the
+--   party/alliance list. A party kill confirms COMPLETED instantly - even if
+--   the kill awards no XP, and even if chat filters hide the defeat line
+--   (chat filters were the suspected cause of missed kills; the packet always
+--   arrives).
+--   Kills by actors outside the party (e.g. pets/avatars) fall back to a
+--   two-step XP confirmation within a short time window:
+--     1. death detected (0x029 packet, or "defeats the <kill_mob>" /
+--        "<kill_mob> falls to the ground" in chat as a further fallback)
 --     2. "<your character> gains <x> experience points." appears shortly after
 --        ("limit points" also counts, for kills made in limit mode)
---   Both must occur within KILL_CONFIRM_WINDOW seconds to count.
---   Once confirmed, the quest goes straight to COMPLETED.
---   Known limitations: the "defeats" line can come from any nearby player's
---   kill, so an unrelated XP gain inside the window can confirm a kill you
---   didn't make; kills that print no experience/limit message never confirm.
+--   The two signals may arrive in EITHER order (message order is not
+--   guaranteed under server load, e.g. when many players hit the same NM);
+--   they confirm as long as both occur within KILL_CONFIRM_WINDOW seconds.
+--   Known limitation of the fallback: an unrelated XP gain inside the window
+--   can confirm a kill made by someone outside your party.
 -- ============================================================================
 
 -- How many seconds after a "defeats the X" message to wait for the XP message
@@ -439,6 +447,12 @@ end
 -- advance those quests to COMPLETED.
 -- { [quest_index] = os.clock() timestamp of the "defeats" message }
 local pending_kills = {}
+
+-- os.clock() timestamp of the player's most recent XP/limit gain message.
+-- Message order is not guaranteed under load - the XP line can render before
+-- the defeat line - so XP gains are remembered and checked when a death is
+-- detected shortly afterwards (see queue_or_confirm_kill).
+local last_xp_gain_time = nil
 
 -- ============================================================================
 -- ENM / Limbus Alert System
@@ -1042,6 +1056,37 @@ local function try_advance(char_name, quest_name, new_status)
     else
         dlog(string.format('try_advance BLOCKED: %s - %s (ord %d) -> %s (ord %d)',
             quest_name, cur, cur_order, new_status, new_order))
+    end
+end
+
+-- Called when a tracked kill mob's death is detected (packet or chat) but the
+-- kill can't be attributed to the party directly. Message order is not
+-- guaranteed under load: if the player's XP gain already arrived within the
+-- confirm window, complete immediately; otherwise queue the kill and wait for
+-- the XP message. Skips quests already completed (e.g. when the packet path
+-- confirmed the kill before the chat line arrived).
+local function queue_or_confirm_kill(qi, q)
+    local kname = get_current_char_name()
+    local already_completed = kname and data[kname] and data[kname].quests
+        and data[kname].quests[q.name] == 'COMPLETED'
+    if already_completed then return end
+
+    local now = os.clock()
+
+    -- Already queued by the other detection path? (The 0x029 packet fires
+    -- first, then the client renders the chat line from it - both paths call
+    -- this helper for the same death.)
+    if pending_kills[qi] and (now - pending_kills[qi]) <= KILL_CONFIRM_WINDOW then
+        return
+    end
+
+    if kname and last_xp_gain_time and (now - last_xp_gain_time) <= KILL_CONFIRM_WINDOW then
+        log(string.format('Kill confirmed: %s (XP received %.1fs earlier)',
+            q.name, now - last_xp_gain_time))
+        try_advance(kname, q.name, 'COMPLETED')
+    else
+        pending_kills[qi] = now
+        log(string.format('Mob defeated: %s - waiting for XP confirm...', q.kill_mob))
     end
 end
 
@@ -2729,8 +2774,7 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
             local falls_phrase  = mob_norm .. ' falls to the ground'
             if string.find(msg, defeat_phrase, 1, true)
                or string.find(msg, falls_phrase, 1, true) then
-                pending_kills[qi] = os.clock()
-                log(string.format('Mob defeated: %s - waiting for XP confirm...', q.kill_mob))
+                queue_or_confirm_kill(qi, q)
             end
         end
     end
@@ -2751,16 +2795,19 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
     local now = os.clock()
 
     -- ------------------------------------------------------------------
-    -- Kill-mob phase 2: look for XP gain to confirm a pending kill.
-    -- The "defeats the X" message (injected) always arrives before the
-    -- XP message (non-injected) as separate text_in events.
+    -- Kill-mob phase 2: track the player's XP gains and confirm pending
+    -- kills. Message order is NOT guaranteed under server load - the XP
+    -- line can render before the defeat line - so every XP gain is
+    -- remembered (last_xp_gain_time) and checked when a death is
+    -- detected later (see queue_or_confirm_kill).
     -- Pattern: "<charname> gains 1234 experience points."
+    -- ("limit points" also counts, for kills made in limit mode.)
     -- ------------------------------------------------------------------
-    if next(pending_kills) then
-        -- "limit points" also counts, for kills made in limit mode.
-        local who = normalize_string(name)
-        if string.find(msg, who .. ' gains %d+ experience points')
-           or string.find(msg, who .. ' gains %d+ limit points') then
+    local who = normalize_string(name)
+    if string.find(msg, who .. ' gains %d+ experience points')
+       or string.find(msg, who .. ' gains %d+ limit points') then
+        last_xp_gain_time = now
+        if next(pending_kills) then
             dlog(string.format('XP message matched: "%s"', msg))
             -- Confirm every pending kill that is still within the window
             for qi, ts in pairs(pending_kills) do
@@ -2778,12 +2825,12 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
             -- Clear all pending kills once XP is confirmed
             pending_kills = {}
         end
+    end
 
-        -- Expire any stale pending kills outside the window
-        for qi, ts in pairs(pending_kills) do
-            if (now - ts) > KILL_CONFIRM_WINDOW then
-                pending_kills[qi] = nil
-            end
+    -- Expire any stale pending kills outside the window
+    for qi, ts in pairs(pending_kills) do
+        if (now - ts) > KILL_CONFIRM_WINDOW then
+            pending_kills[qi] = nil
         end
     end
 
@@ -3179,6 +3226,93 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_01D_inv_finish', func
     local name = get_current_char_name()
     if not name then return end
     scan_exp_band_for_char(name, true)
+end)
+
+-- ============================================================================
+-- Battle Message Packet (0x029) - kill_mob death detection
+-- ============================================================================
+-- Deaths are detected at the packet level because the chat lines are not
+-- reliable: the defeat line never reaches text_in when chat filters hide
+-- others' battle messages, so chat-only detection misses kills.
+-- Relevant MessageNum values:
+--   6  = "<actor> defeats <target>."
+--   20 = "<target> falls to the ground." (DoT death)
+-- The target's name is resolved from its entity index. If the killing actor
+-- is the player or a party/alliance member, the kill is confirmed COMPLETED
+-- instantly (works even when the kill awards no XP). Otherwise (e.g. a
+-- pet/avatar landed the blow) it is queued for the usual XP confirmation.
+-- Packet layout (GP_SERV_COMMAND_BATTLE_MESSAGE, 0-based offsets):
+--   0x04 u32 UniqueNoCas (actor server id)
+--   0x08 u32 UniqueNoTar (target server id)
+--   0x14 u16 ActIndexCas (actor entity index)
+--   0x16 u16 ActIndexTar (target entity index)
+--   0x18 u16 MessageNum
+local KILL_MESSAGE_NUMS = {
+    [6]  = true,   -- defeats
+    [20] = true,   -- falls to the ground
+}
+
+ashita.events.register('packet_in', 'weeklier_packet_in_cb_029_battle_msg', function(e)
+    if e.id ~= 0x029 then return end
+    if not e.data or #e.data < 0x1C then return end
+
+    local message_num = u16le(e.data, 0x18 + 1)
+    if not KILL_MESSAGE_NUMS[message_num] then
+        -- In debug mode, log every battle message aimed at a tracked kill mob
+        -- so unexpected death message IDs can be identified in the field.
+        if debug_mode then
+            local dbg_index = u16le(e.data, 0x16 + 1)
+            local dbg_norm = normalize_string(AshitaCore:GetMemoryManager():GetEntity():GetName(dbg_index))
+            if dbg_norm then
+                for _, q in ipairs(QUESTS) do
+                    if q.type == 'kill_mob' and q.kill_mob and q.kill_mob ~= ''
+                       and dbg_norm == normalize_string(q.kill_mob) then
+                        dlog(string.format('0x029: target=%s msg=%d (not a tracked death message)',
+                            q.kill_mob, message_num))
+                    end
+                end
+            end
+        end
+        return
+    end
+
+    local target_index = u16le(e.data, 0x16 + 1)
+    local target_norm = normalize_string(AshitaCore:GetMemoryManager():GetEntity():GetName(target_index))
+    if not target_norm then return end
+
+    for qi, q in ipairs(QUESTS) do
+        if q.type == 'kill_mob' and q.kill_mob and q.kill_mob ~= ''
+           and target_norm == normalize_string(q.kill_mob) then
+            local kname = get_current_char_name()
+            local already_completed = kname and data[kname] and data[kname].quests
+                and data[kname].quests[q.name] == 'COMPLETED'
+
+            if not already_completed then
+                -- Was the killing blow dealt by the player or a party/alliance member?
+                local actor_id = u32le(e.data, 0x04 + 1)
+                local party_kill = false
+                local party = AshitaCore:GetMemoryManager():GetParty()
+                if party then
+                    for i = 0, 17 do
+                        if party:GetMemberIsActive(i) == 1 and party:GetMemberServerId(i) == actor_id then
+                            party_kill = true
+                            break
+                        end
+                    end
+                end
+
+                dlog(string.format('0x029 kill: %s died (msg=%d, actor_id=%d, party_kill=%s)',
+                    q.kill_mob, message_num, actor_id, tostring(party_kill)))
+
+                if party_kill and kname then
+                    log(string.format('Kill detected: %s defeated by your party.', q.kill_mob))
+                    try_advance(kname, q.name, 'COMPLETED')
+                else
+                    queue_or_confirm_kill(qi, q)
+                end
+            end
+        end
+    end
 end)
 
 -- ============================================================================
