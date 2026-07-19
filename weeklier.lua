@@ -481,6 +481,13 @@ for k, v in pairs(DEFAULT_SETTINGS) do settings[k] = v end
 
 local exp_band_alert_login_done = {}     -- { [char_name] = true }
 
+-- os.time() deadline for the deferred full inventory scan, scheduled by the
+-- 0x01D Inventory Finish handler. The scan must not run at packet time: the
+-- client hasn't processed the inventory burst into memory yet, so an
+-- immediate scan would see empty bags and wrongly clear the stored band.
+local EXP_BAND_SCAN_DELAY = 2            -- seconds after 0x01D before scanning
+local exp_band_scan_at = nil
+
 -- ============================================================================
 -- Key Item Tracking (packet 0x055)
 -- ============================================================================
@@ -1505,8 +1512,9 @@ end
 -- next-use timestamp from item.Extra (bytes 5..8 = LE uint32 vana-relative)
 -- and stores it on the character record.
 -- If allow_clear is true and none are found, the stored band is cleared.
--- Full scans (allow_clear=true) run from the 0x01D Inventory Finish handler
--- (bags fully populated) and from the config-tab toggle.
+-- Full scans (allow_clear=true) are scheduled by the 0x01D Inventory Finish
+-- handler (run deferred from d3d_present once memory has caught up with the
+-- inventory burst) and run directly from the config-tab toggle.
 -- If allow_clear is false (set-only mode), a missing band is ignored: this
 -- is used for the one-time login scan from d3d_present, which can run before
 -- the login inventory burst finishes - individual bags populate at different
@@ -3119,8 +3127,8 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e
     local zone_name = DYNAMIS_ZONES[zone_id]
 
     -- (EXP band scanning on zone-in is handled by the 0x01D Inventory Finish
-    --  packet handler, which fires once the post-zone inventory burst is
-    --  complete. No action needed here.)
+    --  packet handler, which schedules a deferred scan once the post-zone
+    --  inventory burst is complete. No action needed here.)
 
     -- Zoning into a non-Dynamis zone: clear active session
     if not zone_name then
@@ -3213,19 +3221,20 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e
 end)
 
 -- ============================================================================
--- Inventory Finish Packet (0x01D) - authoritative EXP band scan
+-- Inventory Finish Packet (0x01D) - schedules the authoritative EXP band scan
 -- ============================================================================
--- Sent by the server once the post-zone inventory burst is complete, so all
--- bags are fully populated. This is the only scan allowed to clear a stored
--- band (allow_clear = true); the earlier login scan from d3d_present is
--- set-only because it can run mid-burst.
+-- Sent by the server once the post-zone inventory burst is complete. The scan
+-- itself must NOT run here: packet handlers fire before the client has
+-- processed the burst into memory, so an immediate scan sees empty bags and
+-- wrongly clears the stored band (the next zone's 0x020 then re-adds it,
+-- spamming clear/found/READY messages on every zone). Instead, schedule the
+-- full scan (the only one allowed to clear, allow_clear = true) to run from
+-- d3d_present a couple of seconds later, once memory has caught up.
 ashita.events.register('packet_in', 'weeklier_packet_in_cb_01D_inv_finish', function(e)
     if e.id ~= 0x01D then return end
     if not settings.exp_band_tracking_enabled then return end
-
-    local name = get_current_char_name()
-    if not name then return end
-    scan_exp_band_for_char(name, true)
+    exp_band_scan_at = os.time() + EXP_BAND_SCAN_DELAY
+    dlog(string.format('0x01D inventory finish - EXP band scan scheduled in %ds.', EXP_BAND_SCAN_DELAY))
 end)
 
 -- ============================================================================
@@ -3438,12 +3447,21 @@ ashita.events.register('d3d_present', 'weeklier_present_cb', function()
 
         -- EXP Band: one-time login scan + alert check. Set-only scan
         -- (allow_clear=false): bags may not be fully populated this early
-        -- after login; the authoritative full scan runs from the 0x01D
+        -- after login; the authoritative full scan is scheduled by the 0x01D
         -- Inventory Finish handler once the burst completes.
         if settings.exp_band_tracking_enabled and not exp_band_alert_login_done[name] then
             exp_band_alert_login_done[name] = true
             scan_exp_band_for_char(name, false)
             check_exp_band_alerts(name, true)
+        end
+
+        -- EXP Band: deferred full scan scheduled by the 0x01D handler (runs
+        -- once the client has processed the inventory burst into memory).
+        if exp_band_scan_at and os.time() >= exp_band_scan_at then
+            exp_band_scan_at = nil
+            if settings.exp_band_tracking_enabled then
+                scan_exp_band_for_char(name, true)
+            end
         end
     end
 
