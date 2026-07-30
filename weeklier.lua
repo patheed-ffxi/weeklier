@@ -406,11 +406,13 @@ local EXP_BANDS = {
 -- timestamps for use-cooldown items such as EXP bands).
 local VANA_OFFSET = 1009810800
 
--- Bags scanned for EXP bands (intentionally limited - matches user-supplied
--- containerMaxes; bands cannot be used from other storage).
+-- Bags scanned for EXP bands (bands cannot be used from other storage).
+-- Slot counts are upper bounds: scanning a few empty slots is cheap, while
+-- under-scanning an expanded bag (e.g. Gobbiebag inventory upgrades) makes
+-- the scan miss a real band and falsely clear it.
 local EXP_BAND_CONTAINER_MAXES = {
-    Inventory = 70,
-    Satchel   = 60,
+    Inventory = 80,
+    Satchel   = 80,
     Wardrobe  = 80,
     Wardrobe2 = 80,
 }
@@ -506,8 +508,13 @@ local exp_band_alert_login_done = {}     -- { [char_name] = true }
 -- 0x01D Inventory Finish handler. The scan must not run at packet time: the
 -- client hasn't processed the inventory burst into memory yet, so an
 -- immediate scan would see empty bags and wrongly clear the stored band.
+-- Zone loads can also take far longer than the initial delay, so an empty
+-- scan while a band is stored is retried (see d3d_present) rather than
+-- trusted immediately - only the final retry is allowed to clear.
 local EXP_BAND_SCAN_DELAY = 2            -- seconds after 0x01D before scanning
+local EXP_BAND_SCAN_MAX_RETRIES = 10     -- empty re-scans tolerated before clearing
 local exp_band_scan_at = nil
+local exp_band_scan_retries = 0
 
 -- ============================================================================
 -- Key Item Tracking (packet 0x055)
@@ -1540,14 +1547,15 @@ end
 -- next-use timestamp from item.Extra (bytes 5..8 = LE uint32 vana-relative)
 -- and stores it on the character record.
 -- If allow_clear is true and none are found, the stored band is cleared.
--- Full scans (allow_clear=true) are scheduled by the 0x01D Inventory Finish
--- handler (run deferred from d3d_present once memory has caught up with the
--- inventory burst) and run directly from the config-tab toggle.
+-- Clearing scans run only from the retry-gated deferred scan in d3d_present
+-- (final attempt) and directly from the config-tab toggle.
 -- If allow_clear is false (set-only mode), a missing band is ignored: this
--- is used for the one-time login scan from d3d_present, which can run before
--- the login inventory burst finishes - individual bags populate at different
--- times and a partial-load scan would falsely "lose" a band that's actually
--- still in an unloaded wardrobe.
+-- is used for the one-time login scan and the deferred scan's retry
+-- attempts, because bags may not be populated in memory yet and a
+-- partial-load scan would falsely "lose" a band that's actually still in an
+-- unloaded bag.
+-- Returns 'found' when a band was stored/updated, 'cleared' when the stored
+-- band was removed, 'none'/nil otherwise.
 local function scan_exp_band_for_char(char_name, allow_clear)
     if allow_clear == nil then allow_clear = true end
     if not char_name then return end
@@ -1596,6 +1604,9 @@ local function scan_exp_band_for_char(char_name, allow_clear)
         if not same_as_prev then
             local now = os.time()
             if found.expiry_time <= now then
+                -- This log line already announces READY - mark it notified so
+                -- the alert checker doesn't announce it a second time.
+                found.notified_ready = true
                 log(string.format('EXP Band found: %s (%d charge%s) - READY now.',
                     found.name, found.charges, found.charges == 1 and '' or 's'))
             else
@@ -1605,13 +1616,16 @@ local function scan_exp_band_for_char(char_name, allow_clear)
             end
             save_data()
         end
-    else
-        if prev and allow_clear then
-            log('EXP Band no longer in inventory (or out of charges) - clearing.')
-            cd.exp_band = nil
-            save_data()
-        end
+        return 'found'
     end
+
+    if prev and allow_clear then
+        log('EXP Band no longer in inventory (or out of charges) - clearing.')
+        cd.exp_band = nil
+        save_data()
+        return 'cleared'
+    end
+    return 'none'
 end
 
 
@@ -3289,6 +3303,7 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_01D_inv_finish', func
     if e.id ~= 0x01D then return end
     if not settings.exp_band_tracking_enabled then return end
     exp_band_scan_at = os.time() + EXP_BAND_SCAN_DELAY
+    exp_band_scan_retries = 0
     dlog(string.format('0x01D inventory finish - EXP band scan scheduled in %ds.', EXP_BAND_SCAN_DELAY))
 end)
 
@@ -3371,6 +3386,9 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_020_item', function(e
     if not same_as_prev then
         local now = os.time()
         if expiry <= now then
+            -- This log line already announces READY - mark it notified so
+            -- the alert checker doesn't announce it a second time.
+            found.notified_ready = true
             log(string.format('EXP Band found: %s (%d charge%s) - READY now.',
                 band_name, charges, charges == 1 and '' or 's'))
         else
@@ -3423,12 +3441,26 @@ ashita.events.register('d3d_present', 'weeklier_present_cb', function()
             check_exp_band_alerts(name, true)
         end
 
-        -- EXP Band: deferred full scan scheduled by the 0x01D handler (runs
-        -- once the client has processed the inventory burst into memory).
+        -- EXP Band: deferred scan scheduled by the 0x01D handler. Zone loads
+        -- can take far longer than the initial delay (long loading screens),
+        -- so an empty scan while a band is stored is NOT trusted: it is
+        -- retried on the same delay, and only the final attempt runs with
+        -- allow_clear to drop a band that is genuinely gone.
         if exp_band_scan_at and os.time() >= exp_band_scan_at then
             exp_band_scan_at = nil
             if settings.exp_band_tracking_enabled then
-                scan_exp_band_for_char(name, true)
+                local result = scan_exp_band_for_char(name, false)
+                local stored = data[name] and data[name].exp_band
+                if result ~= 'found' and stored then
+                    if exp_band_scan_retries < EXP_BAND_SCAN_MAX_RETRIES then
+                        exp_band_scan_retries = exp_band_scan_retries + 1
+                        exp_band_scan_at = os.time() + EXP_BAND_SCAN_DELAY
+                        dlog(string.format('EXP band scan: stored band not visible in memory yet - retry %d/%d.',
+                            exp_band_scan_retries, EXP_BAND_SCAN_MAX_RETRIES))
+                    else
+                        scan_exp_band_for_char(name, true)
+                    end
+                end
             end
         end
     end
