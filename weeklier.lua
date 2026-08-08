@@ -94,7 +94,7 @@ end
 --                         received, matched after normalizing
 --                         (e.g. "Obtained: Page from the Dragon Chronicles").
 --   enm_cooldown_days   : Number of real days for the cooldown (default 5 for ENMs,
---                         3 for Limbus, 1 for HAAP pages).
+--                         3 for Limbus, 1 for HAAP pages and Assault tags).
 --   These are displayed in their own cooldown section in the UI, separate from
 --   weekly quests. Cooldown data is NOT reset on weekly rollover - it uses its
 --   own timer.
@@ -257,6 +257,18 @@ local QUESTS = {
         name                = 'HAAP - Dragon Chronicles',
         type                = 'enm',
         obtain_phrase       = 'Obtained: Page from the Dragon Chronicles',
+        enm_cooldown_days   = 1,
+    },
+    -- -----------------------------------------------------------------------
+    -- ToAU: Imperial Army I.D. tags for Assault / Nyzul Isle. A new tag can
+    -- be obtained 24 hours (Earth time) after the previous one was issued -
+    -- the timer runs from receiving the tag, not from using it.
+    -- -----------------------------------------------------------------------
+    {
+        name                = 'Assault Tag (Imperial I.D.)',
+        type                = 'enm',
+        ki_quest_active     = 'IMPERIAL_ARMY_ID_TAG',
+        ki_display_name     = 'Imperial Army I.D. tag',
         enm_cooldown_days   = 1,
     },
     -- -----------------------------------------------------------------------
@@ -1530,11 +1542,7 @@ local function get_enm_status(enm_data, q)
     if now >= ready_at then
         return 'READY', KI_COLOR_YES, ready_str
     else
-        local remaining = ready_at - now
-        local days = math.floor(remaining / 86400)
-        local hours = math.floor((remaining % 86400) / 3600)
-        local mins = math.floor((remaining % 3600) / 60)
-        local countdown = string.format('%dd %dh %dm', days, hours, mins)
+        local countdown = format_countdown(ready_at - now)
         return countdown, STATUS_COLORS['NEED TO COMPLETE'], ready_str
     end
 end
@@ -1919,7 +1927,7 @@ local function render_ui()
                     -- ==================================================
                     if #enm_quests > 0 then
                         imgui.Spacing()
-                        if imgui.CollapsingHeader('Cooldowns (ENM / Limbus / HAAP)', ImGuiTreeNodeFlags_DefaultOpen) then
+                        if imgui.CollapsingHeader('Cooldowns (ENM / Limbus / HAAP / Assault)', ImGuiTreeNodeFlags_DefaultOpen) then
 
                             imgui.Columns(6, '##enmCols', true)
                             imgui.SetColumnWidth(0, 30)
