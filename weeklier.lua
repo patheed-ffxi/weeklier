@@ -93,6 +93,11 @@ end
 --                         HAAP pages). Full chat phrase that marks the reward being
 --                         received, matched after normalizing
 --                         (e.g. "Obtained: Page from the Dragon Chronicles").
+--   obtain_zones        : optional set of zone ids ({ [zone_id] = true }). When set,
+--                         an obtain_phrase match only starts the cooldown while the
+--                         player is in one of these zones. Needed when the same item
+--                         is also handed out elsewhere (e.g. quest turn-ins that
+--                         reward HAAP pages) and must not start the cooldown.
 --   enm_cooldown_days   : Number of real days for the cooldown (default 5 for ENMs,
 --                         3 for Limbus, 1 for HAAP pages and Assault tags).
 --   These are displayed in their own cooldown section in the UI, separate from
@@ -138,6 +143,12 @@ local AIRSHIP_ZONES = {
     [224] = true,
     [225] = true,
     [226] = true,
+}
+
+-- Zones where the HAAP vendor exists (used by obtain_zones for HAAP pages).
+-- 248 = Selbina
+local HAAP_ZONES = {
+    [248] = true,
 }
 
 -- Debug mode: when true, logs detailed diagnostic info about status changes,
@@ -246,17 +257,22 @@ local QUESTS = {
     -- HAAP point exchanges: EXP pages are regular items (not key items)
     -- handed out by the HAAP NPC, each on its own independent 24h cooldown.
     -- Detected via the "Obtained: <item>" chat line when the exchange happens.
+    -- Restricted to Selbina (obtain_zones): repeatable quests elsewhere (e.g.
+    -- Uninvited Guests) reward the same pages, which must not start the
+    -- HAAP cooldown.
     -- -----------------------------------------------------------------------
     {
         name                = "HAAP - Miratete's Memoirs",
         type                = 'enm',
         obtain_phrase       = "Obtained: Page from Miratete's Memoirs",
+        obtain_zones        = HAAP_ZONES,
         enm_cooldown_days   = 1,
     },
     {
         name                = 'HAAP - Dragon Chronicles',
         type                = 'enm',
         obtain_phrase       = 'Obtained: Page from the Dragon Chronicles',
+        obtain_zones        = HAAP_ZONES,
         enm_cooldown_days   = 1,
     },
     -- -----------------------------------------------------------------------
@@ -2959,15 +2975,29 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
                 obtain_phrase = 'obtained key item: ' .. normalize_string(q.ki_display_name)
             end
             if obtain_phrase and string.find(msg, obtain_phrase, 1, true) then
-                local cd = ensure_char(name)
-                if cd then
-                    if not cd.enms then cd.enms = {} end
-                    if not cd.enms[q.name] then cd.enms[q.name] = {} end
-                    cd.enms[q.name].ki_obtained_time = os.time()
-                    cd.enms[q.name].notified_ready = nil  -- clear alert flag so next expiry triggers a new notification
-                    local cooldown = q.enm_cooldown_days or 5
-                    log(string.format('%s obtained - %d day cooldown started.', q.name, cooldown))
-                    save_data()
+                -- Zone gate: the same item can be handed out outside the
+                -- vendor's zone (e.g. quest rewards); only matches inside
+                -- obtain_zones start the cooldown.
+                local zone_ok = true
+                if q.obtain_zones then
+                    local zone_id = get_current_zone_id()
+                    zone_ok = zone_id and q.obtain_zones[zone_id]
+                    if not zone_ok then
+                        dlog(string.format('Obtain phrase matched for %s but zone %s is not in obtain_zones - ignored.',
+                            q.name, tostring(zone_id)))
+                    end
+                end
+                if zone_ok then
+                    local cd = ensure_char(name)
+                    if cd then
+                        if not cd.enms then cd.enms = {} end
+                        if not cd.enms[q.name] then cd.enms[q.name] = {} end
+                        cd.enms[q.name].ki_obtained_time = os.time()
+                        cd.enms[q.name].notified_ready = nil  -- clear alert flag so next expiry triggers a new notification
+                        local cooldown = q.enm_cooldown_days or 5
+                        log(string.format('%s obtained - %d day cooldown started.', q.name, cooldown))
+                        save_data()
+                    end
                 end
             end
         end
