@@ -526,6 +526,37 @@ local ASSAULT_AREAS = {
     'Periqia', 'Ilrusi Atoll', 'Nyzul Isle',
 }
 
+-- Orders are handed out on sign-up and taken back when the assault is settled,
+-- so losing one is the immediate signal that a registration has ended.
+local ASSAULT_ORDERS_KIS = {
+    'LEUJAOAM_ASSAULT_ORDERS', 'MAMOOL_JA_ASSAULT_ORDERS', 'LEBROS_ASSAULT_ORDERS',
+    'PERIQIA_ASSAULT_ORDERS', 'ILRUSI_ASSAULT_ORDERS', 'NYZUL_ISLE_ASSAULT_ORDERS',
+}
+
+-- The five Assault reception counters in Whitegate, by event id, mapped to the
+-- index of the staging point they book (matching ASSAULT_AREAS order). Their
+-- event carries a different parameter list to Rytaal's:
+--   param[1] = 1 while carrying an Imperial Army I.D. tag
+--   param[3] = the assault currently registered for (0 = none)
+-- Signing up is the client's reply rather than anything the server sends, so
+-- the mission id comes from the outgoing event option instead:
+--   option & 0xF  == 1 means an assault mission was picked
+--   option >> 4   is its mission id
+local ASSAULT_GIVER_EVENTS = {
+    [273] = 1,  -- Yahsra        - Leujaoam Sanctum
+    [274] = 2,  -- Isdebaaq      - Mamool Ja Training Grounds
+    [275] = 3,  -- Famad         - Lebros Cavern
+    [276] = 4,  -- Lageegee      - Periqia
+    [277] = 5,  -- Bhoy Yhupplo  - Ilrusi Atoll
+}
+
+-- Missions run in blocks of ten per staging point, so a mission id picked at a
+-- counter must fall in that counter's block. Guards against acting on an
+-- option that does not decode the way this build expects.
+local function assault_mission_area(id)
+    return math.floor((id - 1) / 10) + 1
+end
+
 -- ============================================================================
 -- State
 -- ============================================================================
@@ -1652,7 +1683,7 @@ end
 local function assault_mission_name(id)
     local name = ASSAULT_MISSIONS[id]
     if not name then return string.format('#%d', id) end
-    local area = ASSAULT_AREAS[math.min(#ASSAULT_AREAS, math.floor((id - 1) / 10) + 1)]
+    local area = ASSAULT_AREAS[math.min(#ASSAULT_AREAS, assault_mission_area(id))]
     return string.format('%s (%s)', name, area)
 end
 
@@ -1688,6 +1719,28 @@ local function get_assault_status(a)
     end
     local next_at = grant_after(now)
     return tags, max_tags, next_at, next_at + (max_tags - tags - 1) * period
+end
+
+-- Record a tag leaving the stock, seen locally rather than from Rytaal.
+-- Rytaal only sends his event while you are talking to him, so drawing a tag
+-- and walking off would otherwise leave the section showing the pre-draw
+-- stock until the next visit.
+local function note_assault_tag_drawn(a)
+    if not a then return end
+
+    -- Spend from the projected stock, then re-base the reading on now.
+    local tags, max_tags = get_assault_status(a)
+
+    -- Drawing from a full stock is what starts the restock timer server-side,
+    -- and the draw time becomes its phase.
+    if tags >= max_tags then
+        a.draw_time = os.time()
+    end
+
+    a.tags       = math.max(0, tags - 1)
+    a.max_tags   = max_tags
+    a.has_id_tag = true
+    a.updated    = os.time()
 end
 
 -- ============================================================================
@@ -3390,6 +3443,56 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb', function(e)
         end
     end
 
+    -- ------------------------------------------------------------------
+    -- Assault tag / orders key item transitions
+    -- ------------------------------------------------------------------
+    -- Drawing a tag and signing up both happen after Rytaal's event has been
+    -- sent, so without these the section keeps showing the pre-draw reading
+    -- until the next visit. Gated on prev_ki_bitmap so the first 0x055 after
+    -- login, where there is no previous state to compare against, is not read
+    -- as the player having just drawn a tag.
+    if prev_ki_bitmap[table_index] and char_name then
+        local cd = ensure_char(char_name)
+        local a = cd and cd.assault
+        if a then
+            local changed = false
+
+            local tag_id = resolve_ki_id('IMPERIAL_ARMY_ID_TAG')
+            if tag_id and math.floor(tag_id / 512) == table_index then
+                local prev_had = had_key_item(tag_id)
+                local now_has  = has_key_item(tag_id)
+                if now_has and not prev_had then
+                    -- A tag was issued, so one left the stock.
+                    note_assault_tag_drawn(a)
+                    changed = true
+                    log(string.format('Assault tag drawn - stock now %d/%d.',
+                        a.tags, a.max_tags or ASSAULT_MIN_MAX_TAGS))
+                elseif prev_had and not now_has and a.has_id_tag then
+                    -- Traded for assault orders, or handed back.
+                    a.has_id_tag = false
+                    changed = true
+                end
+            end
+
+            -- Orders are taken back when the assault is settled, which is the
+            -- first sign the registration is over.
+            if (a.current_assault or 0) > 0 then
+                for _, ki_name in ipairs(ASSAULT_ORDERS_KIS) do
+                    local ki_id = resolve_ki_id(ki_name)
+                    if ki_id and math.floor(ki_id / 512) == table_index
+                        and had_key_item(ki_id) and not has_key_item(ki_id) then
+                        a.current_assault = 0
+                        changed = true
+                        log('Assault orders cleared.')
+                        break
+                    end
+                end
+            end
+
+            if changed then save_data() end
+        end
+    end
+
     -- Detect KI removals (ki_quest_incomplete -> COMPLETED, ki_quest_active -> READY TO TURN IN or COMPLETED)
     if prev_ki_bitmap[table_index] then
         process_ki_removals(table_index)
@@ -3689,8 +3792,11 @@ end)
 --   0x08  Params[8]  - 8 x uint32
 --   0x2A  Zone       - uint16
 --   0x2C  Menu ID    - uint16
--- Gated on menu id + zone rather than the NPC id: Rytaal is the only NPC that
--- hands out tags, and his NPC id is not guaranteed to match across servers.
+-- The Assault reception counters use the same packet with a different
+-- parameter list, and report the assault currently registered for.
+-- Gated on menu id + zone rather than the NPC id: these are the only NPCs
+-- that issue tags and book assaults, and their NPC ids are not guaranteed to
+-- match across servers.
 -- All offsets are 0-based; Lua string.byte is 1-based, so +1.
 -- ============================================================================
 ashita.events.register('packet_in', 'weeklier_packet_in_cb_034_assault', function(e)
@@ -3702,7 +3808,8 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_034_assault', functio
     local pkt = e.data
     if not pkt or #pkt < 0x34 then return end
 
-    if u16le(pkt, 0x2C + 1) ~= ASSAULT_EVENT_ID then return end
+    local menu = u16le(pkt, 0x2C + 1)
+    if menu ~= ASSAULT_EVENT_ID and not ASSAULT_GIVER_EVENTS[menu] then return end
     if u16le(pkt, 0x2A + 1) ~= ASSAULT_ZONE_ID then return end
 
     local name = get_current_char_name()
@@ -3710,7 +3817,25 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_034_assault', functio
     local cd = ensure_char(name)
     if not cd then return end
 
-    local params_at  = 0x08 + 1
+    local params_at = 0x08 + 1
+
+    -- Reception counter: only the registration and tag possession are useful,
+    -- and there is no stock to record, so never create a reading from one.
+    if ASSAULT_GIVER_EVENTS[menu] then
+        local a = cd.assault
+        if not a then return end
+        local reg    = u32le(pkt, params_at + 12)       -- param[3] current assault
+        local has_ki = u32le(pkt, params_at + 4) ~= 0   -- param[1] carrying the KI
+        if a.current_assault ~= reg or a.has_id_tag ~= has_ki then
+            a.current_assault = reg
+            a.has_id_tag      = has_ki
+            save_data()
+            dlog(string.format('0x034 counter (event %d): registered=%d has_ki=%s',
+                menu, reg, tostring(has_ki)))
+        end
+        return
+    end
+
     local tags       = u32le(pkt, params_at + 4)        -- param[1] tag stock
     local assault_id = u32le(pkt, params_at + 8)        -- param[2] current assault
     local has_id_tag = u32le(pkt, params_at + 12) ~= 0  -- param[3] carrying the KI
@@ -3741,6 +3866,56 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_034_assault', functio
 
     dlog(string.format('0x034 Rytaal: tags=%d assault=%d has_ki=%s anchor=%d',
         tags, assault_id, tostring(has_id_tag), anchor))
+end)
+
+-- ============================================================================
+-- Event Option Packet (0x05B, outgoing) - Assault sign-up
+-- ============================================================================
+-- Picking a mission at a reception counter is the client's reply, so the
+-- server never announces it in a packet we receive. The reply carries the
+-- choice:
+--   0x08  Option  - uint32 (low nibble = selection type, rest = mission id)
+--   0x10  Zone    - uint16
+--   0x12  Menu ID - uint16
+-- Reading it here means the registration lands the moment it is made, rather
+-- than waiting for the next trip to a counter.
+-- ============================================================================
+ashita.events.register('packet_out', 'weeklier_packet_out_cb_05B_assault', function(e)
+    if e.id ~= 0x05B then return end
+
+    local pkt = e.data
+    if not pkt or #pkt < 0x14 then return end
+
+    local area = ASSAULT_GIVER_EVENTS[u16le(pkt, 0x12 + 1)]
+    if not area then return end
+    if u16le(pkt, 0x10 + 1) ~= ASSAULT_ZONE_ID then return end
+
+    local option = u32le(pkt, 0x08 + 1)
+    if bit.band(option, 0xF) ~= 1 then return end   -- not an assault mission selection
+
+    -- Cross-check the mission against the counter that offered it: every
+    -- counter only books its own staging point's block of ten. A mismatch
+    -- means the option does not decode the way this build expects, so the
+    -- registration is left alone rather than set to something invented.
+    local mission = bit.rshift(option, 4)
+    if not ASSAULT_MISSIONS[mission] or assault_mission_area(mission) ~= area then
+        dlog(string.format('0x05B: option 0x%X -> mission %d does not belong to area %d - ignored.',
+            option, mission, area))
+        return
+    end
+
+    local name = get_current_char_name()
+    if not name then return end
+    local cd = ensure_char(name)
+    -- Without a prior reading there is no stock to attach this to, and
+    -- inventing one would show a stock the server never reported.
+    if not cd or not cd.assault then return end
+
+    if cd.assault.current_assault ~= mission then
+        cd.assault.current_assault = mission
+        save_data()
+        log(string.format('Assault registered: %s', assault_mission_name(mission)))
+    end
 end)
 
 -- ============================================================================
