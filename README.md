@@ -89,6 +89,31 @@ Supported zones:
 - Dynamis - Beaucedine, Xarcabard
 - Dynamis - San d'Oria, Bastok, Windurst, Jeuno
 
+### Assault Tags
+
+Tracks the Assault tag stock (banked Imperial Army I.D. tags). Tags are a server-side counter rather than a key item, so the only way to read them is to **talk to Rytaal in Aht Urhgan Whitegate** - the section shows "Unknown" until you do. One visit is enough: the addon stores the restock timer the NPC sends and projects the stock forward from it, so the count and countdowns stay correct without going back.
+
+Rytaal only sends that reading while you are talking to him, which is before you draw a tag or sign up for anything. Everything that happens afterwards is picked up separately:
+
+- **Drawing a tag** - its key item arriving decrements the stock, and starts the restock timer if the stock was full.
+- **Signing up** - the mission is read from the reply the client sends when you pick one at a reception counter, so it is recorded the moment you commit to it. The mission is cross-checked against the counter that offered it, since each counter only books its own staging point.
+- **Talking to a counter** - its event reports the assault you are currently registered for, which corrects the display on any later visit.
+- **Finishing** - the assault orders being taken back clears the registration.
+
+The section shows the current stock and cap, time until the next tag, time until the stock is full, whether you are carrying an undrawn tag, and which assault you are registered for (by name and staging point, e.g. `Seagull Grounded (Periqia)`).
+
+Tags restock up to a cap of 3 (or 4 at Second Lieutenant with every assault completed). The cap is not in the packet, so it is learned from the highest stock seen.
+
+The restock period is not in the packet either. It is 24 hours on HorizonXI and on retail / upstream LandSandBoat, which is the default, but it can be changed per install for servers that tune it:
+
+```
+/weeklier assaultperiod <hours>
+```
+
+Restocks land on a fixed time of day, set by the draw that started the timer. The addon derives the schedule from that time of day rather than from the packet's absolute timestamp, because on HorizonXI that timestamp arrives exactly one period early - verified against `Obtained key item: Imperial Army I.D. tag` chatlog lines. Using only the time of day makes the countdown immune to that offset.
+
+A count projected past what the server actually reported is marked `(est.)`, and the `Last read` row always shows the raw value.
+
 ## Detection Methods
 
 The addon uses multiple detection methods depending on the quest type:
@@ -96,6 +121,8 @@ The addon uses multiple detection methods depending on the quest type:
 - **Packet 0x055 (Key Items)** - Monitors the key item bitmap to detect when quest-related KIs are obtained or removed. KI removal is used to detect quest completion or objective completion.
 - **Packet 0x056 (Quest Log)** - Reads the active quest bitmap to determine if a quest is currently flagged.
 - **Packet 0x00A (Zone-In)** - Detects when the player enters a Dynamis zone to track weekly entrances.
+- **Packet 0x034 (NPC Event)** - Reads the Assault tag stock and restock timer from Rytaal's event parameters, and the currently registered assault from the reception counters' events. Matched on event id (268 for Rytaal, 273-277 for the counters) in Aht Urhgan Whitegate rather than on NPC ids, which are not guaranteed to be identical across servers.
+- **Packet 0x05B (Event Option, outgoing)** - Reads the Assault mission picked at a reception counter, which the server never sends back in a packet of its own.
 - **Chat parsing** - Detects quest flag/completion phrases for bugged quests that don't appear correctly in the quest log. Also used to track Dynamis session timers (injected system messages) and Eco Warrior in-zone verification steps.
 
 ## Installation
