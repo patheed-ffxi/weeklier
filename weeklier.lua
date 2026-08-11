@@ -452,6 +452,81 @@ local EXP_BAND_BAG_NAMES = {
 }
 
 -- ============================================================================
+-- Assault Tag Config
+-- ============================================================================
+-- The Assault tag stock is a server-side counter, not a key item, so the only
+-- way to read it is to talk to Rytaal in Aht Urhgan Whitegate. His event
+-- carries the stock and the restock timer as parameters of packet 0x034:
+--   param[1] = tag stock       (tags currently banked)
+--   param[2] = current assault (mission the player is registered for, 0 = none)
+--   param[3] = 1 while carrying an Imperial Army I.D. tag key item
+--   param[4] = restock anchor  (vana-relative; 0 when no timer is running)
+--   param[5] = 1 when stock > 0
+-- The server restocks one tag per period and advances the anchor by whole
+-- periods as it grants them, so grants always land on the anchor's phase.
+-- Replaying that client-side keeps the stock right between visits, so Rytaal
+-- only has to be visited once rather than every time the count matters.
+--
+-- Two things the packet does not give us:
+--   * The period. It is server-specific, so it lives in
+--     settings.assault_tag_period_hours (see /weeklier assaultperiod).
+--   * A trustworthy absolute anchor. On HorizonXI the decoded anchor lands
+--     exactly one period earlier than the real draw time (verified against
+--     chatlog "Obtained key item: Imperial Army I.D. tag" lines), so its epoch
+--     is off by a whole period.
+-- Only the anchor's PHASE is therefore used: grants are taken to be the times
+-- congruent to the anchor modulo the period, and the stock is projected from
+-- the reading itself rather than from the anchor. The server restocks before
+-- it builds this packet, so the reported stock is current as of the reading -
+-- that makes the projection immune to a whole-period epoch error.
+-- Stored per character in data[char].assault = {
+--   tags            = tag stock as reported by the server
+--   max_tags        = highest stock ever seen (3 normally, 4 at higher rank)
+--   draw_time       = unix timestamp the restock timer runs from (0 = no timer)
+--   has_id_tag      = true while carrying an undrawn Imperial Army I.D. tag
+--   current_assault = assault mission id registered for (0 = none)
+--   updated         = unix timestamp of the last reading from Rytaal
+-- }
+local ASSAULT_EVENT_ID     = 268    -- Rytaal's tag event
+local ASSAULT_ZONE_ID      = 50     -- Aht Urhgan Whitegate
+local ASSAULT_MIN_MAX_TAGS = 3      -- default cap, raised if a higher stock is seen
+
+-- Assault mission names indexed by mission id (param[2] of Rytaal's event),
+-- taken from LandSandBoat's xi.assault.mission enum. The enum runs 1-52 in
+-- staging point blocks of ten and its order matches the per-area instance
+-- lists exactly, so the staging point is derived from the id rather than
+-- carried in a second lookup.
+local ASSAULT_MISSIONS = {
+    -- Leujaoam Sanctum (1-10)
+    'Leujaoam Cleansing', 'Orichalcum Survey', 'Escort Professor Chanoix',
+    'Shanarha Grass Conservation', 'Counting Sheep', 'Supplies Recovery',
+    'Azure Experiments', 'Imperial Code', 'Red Versus Blue', 'Bloody Rondo',
+    -- Mamool Ja Training Grounds (11-20)
+    'Imperial Agent Rescue', 'Preemptive Strike', 'Sagelord Elimination',
+    'Breaking Morale', 'The Double Agent', 'Imperial Treasure Retrieval',
+    'Blitzkrieg', 'Marids in the Mist', 'Azure Ailments', 'The Susanoo Shuffle',
+    -- Lebros Cavern (21-30)
+    'Excavation Duty', 'Lebros Supplies', 'Troll Fugitives', 'Evade and Escape',
+    'Siegemaster Assassination', 'Apkallu Breeding', 'Wamoura Farm Raid',
+    'Egg Conservation', 'Operation Black Pearl', 'Better Than One',
+    -- Periqia (31-40)
+    'Seagull Grounded', 'Requiem', 'Saving Private Ryaaf',
+    'Shooting Down the Baron', 'Building Bridges', 'Stop the Bloodshed',
+    'Defuse the Threat', 'Operation Snake Eyes', 'Wake the Puppet',
+    'The Price Is Right',
+    -- Ilrusi Atoll (41-50)
+    'Golden Salvage', 'Lamia No.13', 'Extermination', 'Demolition Duty',
+    'Searat Salvation', 'Apkallu Seizure', 'Lost and Found', 'Deserter',
+    'Desperately Seeking Cephalopods', "Bellerophon's Bliss",
+    -- Nyzul Isle (51-52)
+    'Nyzul Isle Investigation', 'Nyzul Isle Uncharted Area Survey',
+}
+local ASSAULT_AREAS = {
+    'Leujaoam Sanctum', 'Mamool Ja Training Grounds', 'Lebros Cavern',
+    'Periqia', 'Ilrusi Atoll', 'Nyzul Isle',
+}
+
+-- ============================================================================
 -- State
 -- ============================================================================
 local save_path                             -- set in load_cb (addon.path available then)
@@ -524,8 +599,12 @@ local enm_alert_login_done = {}          -- { [char_name] = true } login alert f
 -- Settings (global, persisted in data._settings):
 --   exp_band_tracking_enabled : when false, scanning, alerts and the UI
 --                               section are all disabled.
+--   assault_tag_period_hours  : hours between Assault tag restocks. Server
+--                               specific and not derivable from the packet.
+--                               24 on HorizonXI and on retail / upstream LSB.
 local DEFAULT_SETTINGS = {
     exp_band_tracking_enabled = true,
+    assault_tag_period_hours  = 24,
 }
 local settings = {}
 for k, v in pairs(DEFAULT_SETTINGS) do settings[k] = v end
@@ -1563,6 +1642,54 @@ local function get_enm_status(enm_data, q)
     end
 end
 
+-- Assault tag status helper
+-- Replays the server's restock math over the last reading so the stock and
+-- the countdowns stay correct without revisiting Rytaal. The stored reading
+-- is left exactly as the server sent it and re-projected on every frame.
+-- Returns: tags, max_tags, next_tag_at (or nil), full_stock_at (or nil)
+-- "Seagull Grounded (Periqia)" for a mission id. Falls back to "#<id>" for an
+-- id this list does not cover, e.g. a server running custom assaults.
+local function assault_mission_name(id)
+    local name = ASSAULT_MISSIONS[id]
+    if not name then return string.format('#%d', id) end
+    local area = ASSAULT_AREAS[math.min(#ASSAULT_AREAS, math.floor((id - 1) / 10) + 1)]
+    return string.format('%s (%s)', name, area)
+end
+
+local function get_assault_status(a)
+    if not a then return nil end
+
+    local period   = (settings.assault_tag_period_hours or 24) * 3600
+    local max_tags = math.max(ASSAULT_MIN_MAX_TAGS, a.max_tags or 0, a.tags or 0)
+    local tags     = a.tags or 0
+    local anchor   = a.draw_time or 0
+    local read_at  = a.updated or 0
+
+    -- No timer running (full stock, or never drawn) means nothing to project.
+    if anchor <= 0 or read_at <= 0 or tags >= max_tags then
+        return tags, max_tags, nil, nil
+    end
+
+    -- First grant strictly after t, on the anchor's phase. Only the phase is
+    -- used, so an anchor whose epoch is off by whole periods still lands on
+    -- the right boundary.
+    local function grant_after(t)
+        return anchor + (math.floor((t - anchor) / period) + 1) * period
+    end
+
+    local now     = os.time()
+    local first   = grant_after(read_at)
+    if now >= first then
+        tags = math.min(max_tags, tags + math.floor((now - first) / period) + 1)
+    end
+
+    if tags >= max_tags then
+        return tags, max_tags, nil, nil
+    end
+    local next_at = grant_after(now)
+    return tags, max_tags, next_at, next_at + (max_tags - tags - 1) * period
+end
+
 -- ============================================================================
 -- EXP Band Inventory Scan
 -- ============================================================================
@@ -1939,6 +2066,89 @@ local function render_ui()
                     end
 
                     -- ==================================================
+                    -- ASSAULT TAGS SECTION (collapsible)
+                    -- ==================================================
+                    if not is_quest_hidden('Assault Tags') then
+                        imgui.Spacing()
+                        if imgui.CollapsingHeader('Assault Tags', ImGuiTreeNodeFlags_DefaultOpen) then
+                            local a = cd.assault
+
+                            -- Label/value rows, built first so the column
+                            -- plumbing below stays a single loop.
+                            local rows = {}
+                            if not a then
+                                rows[1] = { 'Stock', 'Unknown - talk to Rytaal (Whitegate)', KI_COLOR_DIM }
+                            else
+                                local tags, max_tags, next_at, full_at = get_assault_status(a)
+                                local now_ts = os.time()
+
+                                -- Projected past what the server actually said:
+                                -- flag it, because a wrong assault_tag_period_hours
+                                -- would make the projection run ahead of the real
+                                -- stock rather than merely lag behind it.
+                                local projected = tags > (a.tags or 0)
+                                rows[#rows + 1] = { 'Stock',
+                                    string.format('%d / %d%s', tags, max_tags, projected and '  (est.)' or ''),
+                                    tags > 0 and KI_COLOR_YES or KI_COLOR_NO }
+
+                                if next_at then
+                                    rows[#rows + 1] = { 'Next tag', string.format('%s  (%s)',
+                                        format_countdown(next_at - now_ts), format_time(next_at)),
+                                        STATUS_COLORS['NEED TO COMPLETE'] }
+                                    rows[#rows + 1] = { 'Full stock', string.format('%s  (%s)',
+                                        format_countdown(full_at - now_ts), format_time(full_at)),
+                                        KI_COLOR_DIM }
+                                elseif tags >= max_tags then
+                                    rows[#rows + 1] = { 'Next tag', 'Stock full', KI_COLOR_YES }
+                                else
+                                    -- The server only starts the timer when a tag is
+                                    -- drawn from a full stock, so below cap with no
+                                    -- anchor there is genuinely nothing to count down.
+                                    rows[#rows + 1] = { 'Next tag', 'No timer running', KI_COLOR_DIM }
+                                end
+
+                                rows[#rows + 1] = { 'Holding tag', a.has_id_tag and 'Yes' or 'No',
+                                    a.has_id_tag and KI_COLOR_YES or KI_COLOR_DIM }
+
+                                local reg = a.current_assault or 0
+                                rows[#rows + 1] = { 'Registered',
+                                    reg > 0 and assault_mission_name(reg) or '-',
+                                    reg > 0 and KI_COLOR_YES or KI_COLOR_DIM }
+
+                                rows[#rows + 1] = { 'Last read',
+                                    string.format('%s  (server said %d)', format_time(a.updated), a.tags or 0),
+                                    KI_COLOR_DIM }
+                            end
+
+                            imgui.Columns(3, '##assaultCols', true)
+                            imgui.SetColumnWidth(0, 30)
+                            imgui.SetColumnWidth(1, 100)
+
+                            for i, r in ipairs(rows) do
+                                -- Hide button (only on first row)
+                                if i == 1 then
+                                    imgui.PushID('hide_assault')
+                                    if imgui.SmallButton('x') then
+                                        set_quest_hidden('Assault Tags', true)
+                                        save_data()
+                                    end
+                                    imgui.PopID()
+                                else
+                                    imgui.Text('')
+                                end
+                                imgui.NextColumn()
+
+                                imgui.Text(r[1])
+                                imgui.NextColumn()
+                                imgui.TextColored(r[3], r[2])
+                                imgui.NextColumn()
+                            end
+
+                            imgui.Columns(1)
+                        end
+                    end
+
+                    -- ==================================================
                     -- ENM / LIMBUS SECTION (collapsible)
                     -- ==================================================
                     if #enm_quests > 0 then
@@ -2260,6 +2470,19 @@ local function render_ui()
                     imgui.PopID()
                     imgui.SameLine()
                     imgui.Text('[EXP Band] EXP Band (entire section)')
+                end
+
+                -- Assault Tags section
+                if is_quest_hidden('Assault Tags') then
+                    any_hidden = true
+                    imgui.PushID('show_assault_section')
+                    if imgui.SmallButton('Show') then
+                        set_quest_hidden('Assault Tags', false)
+                        save_data()
+                    end
+                    imgui.PopID()
+                    imgui.SameLine()
+                    imgui.Text('[Assault] Assault Tags (entire section)')
                 end
 
                 if not any_hidden then
@@ -2671,6 +2894,21 @@ ashita.events.register('command', 'weeklier_command_cb', function(e)
         return
     end
 
+    if sub == 'assaultperiod' then
+        -- Server-specific and not derivable from the packet, so it has to be
+        -- set per install rather than shipped as a constant.
+        local hours = tonumber(args[3])
+        if not hours or hours <= 0 then
+            log(string.format('Assault tag restock period: %d hours. Set with /weeklier assaultperiod <hours>.',
+                settings.assault_tag_period_hours or 24))
+            return
+        end
+        settings.assault_tag_period_hours = hours
+        save_data()
+        log(string.format('Assault tag restock period set to %d hours.', hours))
+        return
+    end
+
     if sub == 'help' then
         log('Commands:')
         log('  /weeklier show    - toggle the tracker window')
@@ -2679,6 +2917,7 @@ ashita.events.register('command', 'weeklier_command_cb', function(e)
         log('  /weeklier reset   - reset current character\'s quests')
         log('  /weeklier resetall- clear ALL character data')
         log('  /weeklier debug   - toggle debug logging')
+        log('  /weeklier assaultperiod <hours> - Assault tag restock period (default 24)')
         log('  /weeklier dump    - dump current packet state for diagnostics')
         log('  /weeklier help    - show this help')
         return
@@ -3438,6 +3677,70 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_020_item', function(e
     end
 
     check_exp_band_alerts(cur, false)
+end)
+
+-- ============================================================================
+-- NPC Event Packet (0x034) - Assault tag stock
+-- ============================================================================
+-- Rytaal reports the tag stock and restock timer as event parameters.
+-- Packet layout:
+--   0x00  header (4 bytes: id/size/sync)
+--   0x04  NPC id     - uint32
+--   0x08  Params[8]  - 8 x uint32
+--   0x2A  Zone       - uint16
+--   0x2C  Menu ID    - uint16
+-- Gated on menu id + zone rather than the NPC id: Rytaal is the only NPC that
+-- hands out tags, and his NPC id is not guaranteed to match across servers.
+-- All offsets are 0-based; Lua string.byte is 1-based, so +1.
+-- ============================================================================
+ashita.events.register('packet_in', 'weeklier_packet_in_cb_034_assault', function(e)
+    if e.id ~= 0x034 then return end
+
+    -- Clear stale packet state if the character has changed since last packet
+    check_packet_char_change()
+
+    local pkt = e.data
+    if not pkt or #pkt < 0x34 then return end
+
+    if u16le(pkt, 0x2C + 1) ~= ASSAULT_EVENT_ID then return end
+    if u16le(pkt, 0x2A + 1) ~= ASSAULT_ZONE_ID then return end
+
+    local name = get_current_char_name()
+    if not name then return end
+    local cd = ensure_char(name)
+    if not cd then return end
+
+    local params_at  = 0x08 + 1
+    local tags       = u32le(pkt, params_at + 4)        -- param[1] tag stock
+    local assault_id = u32le(pkt, params_at + 8)        -- param[2] current assault
+    local has_id_tag = u32le(pkt, params_at + 12) ~= 0  -- param[3] carrying the KI
+    local anchor     = u32le(pkt, params_at + 16)       -- param[4] restock anchor
+
+    local prev = cd.assault
+    local draw_time = anchor > 0 and (anchor + VANA_OFFSET) or 0
+    cd.assault = {
+        tags            = tags,
+        -- The packet carries the stock but not the cap, so the cap is learned
+        -- from the highest stock ever seen (4 at Second Lieutenant with every
+        -- assault completed, 3 otherwise).
+        max_tags        = math.max(ASSAULT_MIN_MAX_TAGS, tags, prev and prev.max_tags or 0),
+        draw_time       = draw_time,
+        has_id_tag      = has_id_tag,
+        current_assault = assault_id,
+        updated         = os.time(),
+    }
+    save_data()
+
+    -- Only announce when the reading actually moved: re-triggering Rytaal's
+    -- menu resends the same event and would otherwise spam the log.
+    if not prev or prev.tags ~= tags or prev.draw_time ~= draw_time then
+        local shown, max_tags, next_at = get_assault_status(cd.assault)
+        log(string.format('Assault tags: %d/%d%s', shown, max_tags,
+            next_at and string.format(' - next in %s', format_countdown(next_at - os.time())) or ''))
+    end
+
+    dlog(string.format('0x034 Rytaal: tags=%d assault=%d has_ki=%s anchor=%d',
+        tags, assault_id, tostring(has_id_tag), anchor))
 end)
 
 -- ============================================================================
