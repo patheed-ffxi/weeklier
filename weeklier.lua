@@ -4,7 +4,7 @@ local imgui = require('imgui')
 
 addon.name    = 'weeklier'
 addon.author  = 'Pathead'
-addon.version = '1.5'
+addon.version = '1.6'
 addon.desc    = 'Tracks weekly quest completion across characters.'
 addon.link    = 'https://github.com/patheed-ffxi/weeklier'
 
@@ -479,14 +479,25 @@ local EXP_BAND_BAG_NAMES = {
 -- the reading itself rather than from the anchor. The server restocks before
 -- it builds this packet, so the reported stock is current as of the reading -
 -- that makes the projection immune to a whole-period epoch error.
--- Stored per character in data[char].assault = {
---   tags            = tag stock as reported by the server
---   max_tags        = highest stock ever seen (3 normally, 4 at higher rank)
---   draw_time       = unix timestamp the restock timer runs from (0 = no timer)
---   has_id_tag      = true while carrying an undrawn Imperial Army I.D. tag
---   current_assault = assault mission id registered for (0 = none)
---   updated         = unix timestamp of the last reading from Rytaal
--- }
+-- On HorizonXI the stock is one pool shared by every character on the account:
+-- a tag drawn on one is gone for all of them, and the restock timer runs once
+-- for the account rather than once per character. The stock is therefore stored
+-- once, beside the other non-character keys in the save file:
+--   data._assault = {
+--     tags      = tag stock as reported by the server
+--     max_tags  = highest stock ever seen (3 normally, 4 at higher rank)
+--     draw_time = unix timestamp the restock timer runs from (0 = no timer)
+--     updated   = unix timestamp of the last reading from Rytaal
+--     source    = name of the character that took that reading
+--   }
+-- Key items and registrations really are per character, so those stay put:
+--   data[char].assault = {
+--     has_id_tag      = true while carrying an undrawn Imperial Army I.D. tag
+--     current_assault = assault mission id registered for (0 = none)
+--   }
+-- Every tracked character is taken to be on the one account. The client never
+-- sends an account id, so there is nothing to group them by; a second account
+-- played through the same install would share this record with the first.
 local ASSAULT_EVENT_ID     = 268    -- Rytaal's tag event
 local ASSAULT_ZONE_ID      = 50     -- Aht Urhgan Whitegate
 local ASSAULT_MIN_MAX_TAGS = 3      -- default cap, raised if a higher stock is seen
@@ -929,6 +940,34 @@ local function load_data()
         return
     end
     data = decoded
+
+    -- Saves from before the stock was known to be account-wide kept it on each
+    -- character. Adopt the newest of those readings as the shared one and drop
+    -- the stock fields from the character entries, which keep only the key item
+    -- and the registration that genuinely are per character.
+    local adopted
+    for cname, cdata in pairs(data) do
+        if cname ~= '_hidden' and cname ~= '_settings' and cname ~= '_assault'
+            and type(cdata) == 'table' and type(cdata.assault) == 'table'
+            and cdata.assault.updated ~= nil then
+            local a = cdata.assault
+            if not adopted or (a.updated or 0) > (adopted.updated or 0) then
+                adopted = {
+                    tags      = a.tags or 0,
+                    max_tags  = a.max_tags or 0,
+                    draw_time = a.draw_time or 0,
+                    updated   = a.updated or 0,
+                    source    = cname,
+                }
+            end
+            a.tags, a.max_tags, a.draw_time, a.updated = nil, nil, nil, nil
+        end
+    end
+    if adopted and type(data._assault) ~= 'table' then
+        data._assault = adopted
+        log(string.format('Assault tag stock is account-wide: adopted the reading from %s as the shared stock.',
+            adopted.source))
+    end
 
     -- Restore hidden quests from saved data
     if type(data._hidden) == 'table' then
@@ -1687,6 +1726,27 @@ local function assault_mission_name(id)
     return string.format('%s (%s)', name, area)
 end
 
+-- The stock is account-wide (see the Assault Tag Config block), so it is read
+-- from and written to one shared record rather than the character's. Stays nil
+-- until Rytaal has actually been talked to: an invented stock would be
+-- indistinguishable from one the server reported.
+local function get_assault_pool()
+    local p = data._assault
+    return type(p) == 'table' and p or nil
+end
+
+-- The per-character half of the record: what this character is carrying and
+-- signed up for. Safe to create on demand, because both fields come straight
+-- from a packet rather than from a stock the server never sent.
+local function ensure_char_assault(cd)
+    if not cd then return nil end
+    if type(cd.assault) ~= 'table' then
+        cd.assault = { has_id_tag = false, current_assault = 0 }
+    end
+    return cd.assault
+end
+
+-- Takes the shared pool, not a character record.
 local function get_assault_status(a)
     if not a then return nil end
 
@@ -1721,10 +1781,11 @@ local function get_assault_status(a)
     return tags, max_tags, next_at, next_at + (max_tags - tags - 1) * period
 end
 
--- Record a tag leaving the stock, seen locally rather than from Rytaal.
--- Rytaal only sends his event while you are talking to him, so drawing a tag
--- and walking off would otherwise leave the section showing the pre-draw
--- stock until the next visit.
+-- Record a tag leaving the account's stock, seen locally rather than from
+-- Rytaal. Rytaal only sends his event while you are talking to him, so drawing
+-- a tag and walking off would otherwise leave the section showing the pre-draw
+-- stock until the next visit. Takes the shared pool; the key item that arrives
+-- with the draw is the drawing character's own business.
 local function note_assault_tag_drawn(a)
     if not a then return end
 
@@ -1737,10 +1798,9 @@ local function note_assault_tag_drawn(a)
         a.draw_time = os.time()
     end
 
-    a.tags       = math.max(0, tags - 1)
-    a.max_tags   = max_tags
-    a.has_id_tag = true
-    a.updated    = os.time()
+    a.tags     = math.max(0, tags - 1)
+    a.max_tags = max_tags
+    a.updated  = os.time()
 end
 
 -- ============================================================================
@@ -1936,10 +1996,11 @@ local function render_ui()
         imgui.Separator()
 
         -- Collect character names sorted alphabetically, current char first
-        -- Filter out the _hidden / _settings keys which are not characters
+        -- Filter out the _hidden / _settings / _assault keys, which are not
+        -- characters
         local char_names = {}
         for name, _ in pairs(data) do
-            if name ~= '_hidden' and name ~= '_settings' then
+            if name ~= '_hidden' and name ~= '_settings' and name ~= '_assault' then
                 char_names[#char_names + 1] = name
             end
         end
@@ -2124,23 +2185,27 @@ local function render_ui()
                     if not is_quest_hidden('Assault Tags') then
                         imgui.Spacing()
                         if imgui.CollapsingHeader('Assault Tags', ImGuiTreeNodeFlags_DefaultOpen) then
-                            local a = cd.assault
+                            -- The stock is one account-wide pool, so it reads
+                            -- the same on every character's tab. Only the tag
+                            -- in hand and the registration belong to this one.
+                            local pool = get_assault_pool()
+                            local a    = cd.assault
 
                             -- Label/value rows, built first so the column
                             -- plumbing below stays a single loop.
                             local rows = {}
-                            if not a then
-                                rows[1] = { 'Stock', 'Unknown - talk to Rytaal (Whitegate)', KI_COLOR_DIM }
+                            if not pool then
+                                rows[#rows + 1] = { 'Stock (account)', 'Unknown - talk to Rytaal (Whitegate)', KI_COLOR_DIM }
                             else
-                                local tags, max_tags, next_at, full_at = get_assault_status(a)
+                                local tags, max_tags, next_at, full_at = get_assault_status(pool)
                                 local now_ts = os.time()
 
                                 -- Projected past what the server actually said:
                                 -- flag it, because a wrong assault_tag_period_hours
                                 -- would make the projection run ahead of the real
                                 -- stock rather than merely lag behind it.
-                                local projected = tags > (a.tags or 0)
-                                rows[#rows + 1] = { 'Stock',
+                                local projected = tags > (pool.tags or 0)
+                                rows[#rows + 1] = { 'Stock (account)',
                                     string.format('%d / %d%s', tags, max_tags, projected and '  (est.)' or ''),
                                     tags > 0 and KI_COLOR_YES or KI_COLOR_NO }
 
@@ -2159,23 +2224,29 @@ local function render_ui()
                                     -- anchor there is genuinely nothing to count down.
                                     rows[#rows + 1] = { 'Next tag', 'No timer running', KI_COLOR_DIM }
                                 end
+                            end
 
-                                rows[#rows + 1] = { 'Holding tag', a.has_id_tag and 'Yes' or 'No',
-                                    a.has_id_tag and KI_COLOR_YES or KI_COLOR_DIM }
+                            -- This character's own rows, shown whether or not
+                            -- the account stock has ever been read.
+                            local has_tag = a and a.has_id_tag or false
+                            rows[#rows + 1] = { 'Holding tag', has_tag and 'Yes' or 'No',
+                                has_tag and KI_COLOR_YES or KI_COLOR_DIM }
 
-                                local reg = a.current_assault or 0
-                                rows[#rows + 1] = { 'Registered',
-                                    reg > 0 and assault_mission_name(reg) or '-',
-                                    reg > 0 and KI_COLOR_YES or KI_COLOR_DIM }
+                            local reg = a and a.current_assault or 0
+                            rows[#rows + 1] = { 'Registered',
+                                reg > 0 and assault_mission_name(reg) or '-',
+                                reg > 0 and KI_COLOR_YES or KI_COLOR_DIM }
 
+                            if pool then
                                 rows[#rows + 1] = { 'Last read',
-                                    string.format('%s  (server said %d)', format_time(a.updated), a.tags or 0),
+                                    string.format('%s by %s  (said %d)', format_time(pool.updated),
+                                        pool.source or 'unknown', pool.tags or 0),
                                     KI_COLOR_DIM }
                             end
 
                             imgui.Columns(3, '##assaultCols', true)
                             imgui.SetColumnWidth(0, 30)
-                            imgui.SetColumnWidth(1, 100)
+                            imgui.SetColumnWidth(1, 115)
 
                             for i, r in ipairs(rows) do
                                 -- Hide button (only on first row)
@@ -2556,7 +2627,8 @@ local function render_ui()
                 -- Build character list
                 local override_chars = {}
                 for cname, cdata in pairs(data) do
-                    if cname ~= '_hidden' and cname ~= '_settings' and type(cdata) == 'table' then
+                    if cname ~= '_hidden' and cname ~= '_settings' and cname ~= '_assault'
+                        and type(cdata) == 'table' then
                         override_chars[#override_chars + 1] = cname
                     end
                 end
@@ -2845,7 +2917,8 @@ ashita.events.register('load', 'weeklier_load_cb', function()
     -- Normalize every stored character so weekly rollover resets apply even
     -- to characters that haven't logged in since the reset.
     for cname, cdata in pairs(data) do
-        if cname ~= '_hidden' and cname ~= '_settings' and type(cdata) == 'table' then
+        if cname ~= '_hidden' and cname ~= '_settings' and cname ~= '_assault'
+            and type(cdata) == 'table' then
             ensure_char(cname)
         end
     end
@@ -3453,7 +3526,7 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb', function(e)
     -- as the player having just drawn a tag.
     if prev_ki_bitmap[table_index] and char_name then
         local cd = ensure_char(char_name)
-        local a = cd and cd.assault
+        local a = ensure_char_assault(cd)
         if a then
             local changed = false
 
@@ -3461,16 +3534,26 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb', function(e)
             if tag_id and math.floor(tag_id / 512) == table_index then
                 local prev_had = had_key_item(tag_id)
                 local now_has  = has_key_item(tag_id)
+
+                -- The key item is this character's, and the bitmap is the
+                -- authority on it: mirror it rather than tracking transitions,
+                -- so a character already holding a tag reads correctly the
+                -- first time the addon sees it.
+                if a.has_id_tag ~= now_has then
+                    a.has_id_tag = now_has
+                    changed = true
+                end
+
+                -- Gaining it is a draw, though, and a draw is what takes one
+                -- out of the account's stock.
                 if now_has and not prev_had then
-                    -- A tag was issued, so one left the stock.
-                    note_assault_tag_drawn(a)
-                    changed = true
-                    log(string.format('Assault tag drawn - stock now %d/%d.',
-                        a.tags, a.max_tags or ASSAULT_MIN_MAX_TAGS))
-                elseif prev_had and not now_has and a.has_id_tag then
-                    -- Traded for assault orders, or handed back.
-                    a.has_id_tag = false
-                    changed = true
+                    local pool = get_assault_pool()
+                    if pool then
+                        note_assault_tag_drawn(pool)
+                        changed = true
+                        log(string.format('Assault tag drawn - account stock now %d/%d.',
+                            pool.tags, pool.max_tags or ASSAULT_MIN_MAX_TAGS))
+                    end
                 end
             end
 
@@ -3820,9 +3903,9 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_034_assault', functio
     local params_at = 0x08 + 1
 
     -- Reception counter: only the registration and tag possession are useful,
-    -- and there is no stock to record, so never create a reading from one.
+    -- and its event carries no stock, so it never writes the shared pool.
     if ASSAULT_GIVER_EVENTS[menu] then
-        local a = cd.assault
+        local a = ensure_char_assault(cd)
         if not a then return end
         local reg    = u32le(pkt, params_at + 12)       -- param[3] current assault
         local has_ki = u32le(pkt, params_at + 4) ~= 0   -- param[1] carrying the KI
@@ -3841,25 +3924,30 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_034_assault', functio
     local has_id_tag = u32le(pkt, params_at + 12) ~= 0  -- param[3] carrying the KI
     local anchor     = u32le(pkt, params_at + 16)       -- param[4] restock anchor
 
-    local prev = cd.assault
+    local prev = get_assault_pool()
     local draw_time = anchor > 0 and (anchor + VANA_OFFSET) or 0
-    cd.assault = {
-        tags            = tags,
+    data._assault = {
+        tags      = tags,
         -- The packet carries the stock but not the cap, so the cap is learned
         -- from the highest stock ever seen (4 at Second Lieutenant with every
         -- assault completed, 3 otherwise).
-        max_tags        = math.max(ASSAULT_MIN_MAX_TAGS, tags, prev and prev.max_tags or 0),
-        draw_time       = draw_time,
-        has_id_tag      = has_id_tag,
-        current_assault = assault_id,
-        updated         = os.time(),
+        max_tags  = math.max(ASSAULT_MIN_MAX_TAGS, tags, prev and prev.max_tags or 0),
+        draw_time = draw_time,
+        updated   = os.time(),
+        -- One stock stands behind every character, so the tab being looked at
+        -- is often not the one that took the reading. Say which one did.
+        source    = name,
     }
+
+    local a = ensure_char_assault(cd)
+    a.has_id_tag      = has_id_tag
+    a.current_assault = assault_id
     save_data()
 
     -- Only announce when the reading actually moved: re-triggering Rytaal's
     -- menu resends the same event and would otherwise spam the log.
     if not prev or prev.tags ~= tags or prev.draw_time ~= draw_time then
-        local shown, max_tags, next_at = get_assault_status(cd.assault)
+        local shown, max_tags, next_at = get_assault_status(data._assault)
         log(string.format('Assault tags: %d/%d%s', shown, max_tags,
             next_at and string.format(' - next in %s', format_countdown(next_at - os.time())) or ''))
     end
@@ -3907,12 +3995,11 @@ ashita.events.register('packet_out', 'weeklier_packet_out_cb_05B_assault', funct
     local name = get_current_char_name()
     if not name then return end
     local cd = ensure_char(name)
-    -- Without a prior reading there is no stock to attach this to, and
-    -- inventing one would show a stock the server never reported.
-    if not cd or not cd.assault then return end
+    local a  = ensure_char_assault(cd)
+    if not a then return end
 
-    if cd.assault.current_assault ~= mission then
-        cd.assault.current_assault = mission
+    if a.current_assault ~= mission then
+        a.current_assault = mission
         save_data()
         log(string.format('Assault registered: %s', assault_mission_name(mission)))
     end

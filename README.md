@@ -93,9 +93,13 @@ Supported zones:
 
 Tracks the Assault tag stock (banked Imperial Army I.D. tags). Tags are a server-side counter rather than a key item, so the only way to read them is to **talk to Rytaal in Aht Urhgan Whitegate** - the section shows "Unknown" until you do. One visit is enough: the addon stores the restock timer the NPC sends and projects the stock forward from it, so the count and countdowns stay correct without going back.
 
+On HorizonXI the stock is **shared across the whole account** - one pool of tags behind every character, restocking on one timer. The addon stores it once instead of per character, so a reading taken on any character shows on all of their tabs (labelled `Stock (account)`), a tag drawn on one is deducted for all of them, and `Last read` names the character the reading came from. Only `Holding tag` and `Registered` are per character, because a tag in hand is a key item and a sign-up is a registration - neither is part of the stock.
+
+The client never sends an account id, so there is nothing to group characters by: every character the addon tracks is taken to be on the one account. Two accounts played through the same Ashita install would share the one record.
+
 Rytaal only sends that reading while you are talking to him, which is before you draw a tag or sign up for anything. Everything that happens afterwards is picked up separately:
 
-- **Drawing a tag** - its key item arriving decrements the stock, and starts the restock timer if the stock was full.
+- **Drawing a tag** - its key item arriving decrements the account's stock, and starts the restock timer if the stock was full.
 - **Signing up** - the mission is read from the reply the client sends when you pick one at a reception counter, so it is recorded the moment you commit to it. The mission is cross-checked against the counter that offered it, since each counter only books its own staging point.
 - **Talking to a counter** - its event reports the assault you are currently registered for, which corrects the display on any later visit.
 - **Finishing** - the assault orders being taken back clears the registration.
@@ -113,6 +117,8 @@ The restock period is not in the packet either. It is 24 hours on HorizonXI and 
 Restocks land on a fixed time of day, set by the draw that started the timer. The addon derives the schedule from that time of day rather than from the packet's absolute timestamp, because on HorizonXI that timestamp arrives exactly one period early - verified against `Obtained key item: Imperial Army I.D. tag` chatlog lines. Using only the time of day makes the countdown immune to that offset.
 
 A count projected past what the server actually reported is marked `(est.)`, and the `Last read` row always shows the raw value.
+
+Save files written before 1.6 kept a stock on each character. They are migrated on first load: the most recent of those readings becomes the shared one, and the stock fields are dropped from the character entries.
 
 ## Detection Methods
 
@@ -179,7 +185,7 @@ The Config tab provides a manual status override for any quest, ENM / Limbus, Ec
 
 ## Data Storage
 
-All data is saved to `char_data.json` in the addon directory. This includes per-character quest status, ENM / Limbus cooldown timers, Eco Warrior rotation history, Dynamis entry logs, and UI preferences (hidden quests).
+All data is saved to `char_data.json` in the addon directory. This includes per-character quest status, ENM / Limbus cooldown timers, Eco Warrior rotation history, Dynamis entry logs, the account-wide Assault tag stock, and UI preferences (hidden quests).
 
 ## Dependencies
 
