@@ -100,6 +100,14 @@ end
 --                         reward HAAP pages) and must not start the cooldown.
 --   enm_cooldown_days   : Number of real days for the cooldown (default 5 for ENMs,
 --                         3 for Limbus, 1 for HAAP pages and Assault tags).
+--   enm_resets_jst_daily : optional. When true the cooldown lifts at the first
+--                         JST midnight (15:00 UTC) after obtaining instead of
+--                         after enm_cooldown_days (ISNM orders).
+--   cooldown_group      : optional name shared by rows that are one server-side
+--                         lock shown once per key item (the two ISNM orders).
+--                         Obtaining any row's reward starts every row in the
+--                         group, the Config buttons act on the whole group, and
+--                         the ready alert names the group once.
 --   These are displayed in their own cooldown section in the UI, separate from
 --   weekly quests. Cooldown data is NOT reset on weekly rollover - it uses its
 --   own timer.
@@ -286,6 +294,29 @@ local QUESTS = {
         ki_quest_active     = 'IMPERIAL_ARMY_ID_TAG',
         ki_display_name     = 'Imperial Army I.D. tag',
         enm_cooldown_days   = 1,
+    },
+    -- -----------------------------------------------------------------------
+    -- ToAU: ISNM orders from Shajaf (Aht Urhgan Whitegate). 2000 Imperial
+    -- Standing buys a Confidential Imperial order (the level-60 fights), 3000
+    -- a Secret Imperial order (uncapped). A character can buy one order per
+    -- JST day, whichever it is, so the two rows share one lock that lifts at
+    -- the next JST midnight.
+    -- -----------------------------------------------------------------------
+    {
+        name                 = 'ISNM Order (2000)',
+        type                 = 'enm',
+        ki_quest_active      = 'CONFIDENTIAL_IMPERIAL_ORDER',
+        ki_display_name      = 'Confidential Imperial order',
+        enm_resets_jst_daily = true,
+        cooldown_group       = 'ISNM Orders',
+    },
+    {
+        name                 = 'ISNM Order (3000)',
+        type                 = 'enm',
+        ki_quest_active      = 'SECRET_IMPERIAL_ORDER',
+        ki_display_name      = 'Secret Imperial order',
+        enm_resets_jst_daily = true,
+        cooldown_group       = 'ISNM Orders',
     },
     -- -----------------------------------------------------------------------
     -- Kill-based quest: no flag or turn-in, just kill the mob and get XP.
@@ -865,6 +896,11 @@ local function get_next_reset_time()
     end
 
     return reset
+end
+
+-- The first JST midnight (15:00 UTC) strictly after t.
+local function next_jst_midnight(t)
+    return t - ((t + 9 * 3600) % 86400) + 86400
 end
 
 -- Format a duration in seconds as "Xd Xh Xm Xs"
@@ -1696,17 +1732,40 @@ local ECO_STATUS_COLORS = {
     ['Not Available']    = { 0.6, 0.6, 0.6, 1.0 },     -- grey
 }
 
+-- When a cooldown row's reward can be obtained again. Most rows run a number
+-- of days from the obtain; enm_resets_jst_daily rows lift at the next JST
+-- midnight instead.
+local function enm_ready_at(q, obtained)
+    if q.enm_resets_jst_daily then
+        return next_jst_midnight(obtained)
+    end
+    return obtained + (q.enm_cooldown_days or 5) * 86400
+end
+
+-- Starts (ts) or clears (nil) a cooldown row, and every row sharing its
+-- cooldown_group: those are one server-side lock shown once per key item.
+local function set_enm_cooldown(cd, q, ts)
+    if not cd.enms then cd.enms = {} end
+    for _, other in ipairs(QUESTS) do
+        if other.type == 'enm'
+            and (other == q or (q.cooldown_group and other.cooldown_group == q.cooldown_group)) then
+            if not cd.enms[other.name] then cd.enms[other.name] = {} end
+            cd.enms[other.name].ki_obtained_time = ts
+            cd.enms[other.name].notified_ready = nil  -- the next expiry alerts afresh
+        end
+    end
+end
+
 -- ENM cooldown status helper
 -- Returns: status_text, color, ready_time_text
 local function get_enm_status(enm_data, q)
-    local cooldown_secs = (q.enm_cooldown_days or 5) * 86400
     local obtained = enm_data and enm_data.ki_obtained_time or nil
 
     if not obtained then
         return 'READY', KI_COLOR_YES, '-'
     end
 
-    local ready_at = obtained + cooldown_secs
+    local ready_at = enm_ready_at(q, obtained)
     local now = os.time()
     local ready_str = format_time(ready_at)
 
@@ -1938,25 +1997,29 @@ local function check_enm_alerts(char_name, is_login_check)
     if not cd or not cd.enms then return end
 
     local ready_names = {}
+    local named = {}   -- a cooldown_group is announced once, under its own name
 
     for _, q in ipairs(QUESTS) do
         if q.type == 'enm' then
             local enm_data = cd.enms[q.name]
             if enm_data then
-                local cooldown_secs = (q.enm_cooldown_days or 5) * 86400
                 local obtained = enm_data.ki_obtained_time
 
                 -- Determine if the ENM is ready
                 local is_ready = false
                 if not obtained then
                     is_ready = true   -- never obtained = always ready
-                elseif os.time() >= (obtained + cooldown_secs) then
+                elseif os.time() >= enm_ready_at(q, obtained) then
                     is_ready = true   -- cooldown expired
                 end
 
                 if is_ready and not enm_data.notified_ready then
                     enm_data.notified_ready = true
-                    ready_names[#ready_names + 1] = q.name
+                    local label = q.cooldown_group or q.name
+                    if not named[label] then
+                        named[label] = true
+                        ready_names[#ready_names + 1] = label
+                    end
                     dlog(string.format('ENM alert: %s is READY for %s', q.name, char_name))
                 end
             end
@@ -2282,7 +2345,7 @@ local function render_ui()
                     -- ==================================================
                     if #enm_quests > 0 then
                         imgui.Spacing()
-                        if imgui.CollapsingHeader('Cooldowns (ENM / Limbus / HAAP / Assault)', ImGuiTreeNodeFlags_DefaultOpen) then
+                        if imgui.CollapsingHeader('Cooldowns (ENM / Limbus / HAAP / Assault / ISNM)', ImGuiTreeNodeFlags_DefaultOpen) then
 
                             imgui.Columns(6, '##enmCols', true)
                             imgui.SetColumnWidth(0, 30)
@@ -2693,7 +2756,7 @@ local function render_ui()
 
                         -- ---- ENMs / Limbus ----
                         imgui.Spacing()
-                        if imgui.CollapsingHeader('Override: Cooldowns (ENM / Limbus / HAAP)##ovr_enm') then
+                        if imgui.CollapsingHeader('Override: Cooldowns (ENM / Limbus / HAAP / Assault / ISNM)##ovr_enm') then
                             for _, q in ipairs(QUESTS) do
                                 if q.type == 'enm' then
                                     if not ocd.enms then ocd.enms = {} end
@@ -2724,8 +2787,7 @@ local function render_ui()
 
                                     imgui.PushID('ovr_enm_cdn_' .. q.name)
                                     if imgui.SmallButton('Start CD') then
-                                        enm.ki_obtained_time = os.time()
-                                        enm.notified_ready = nil  -- reset alert flag
+                                        set_enm_cooldown(ocd, q, os.time())
                                         log(string.format('Manual override: %s [%s] cooldown started now',
                                             q.name, override_selected_char))
                                         save_data()
@@ -2735,8 +2797,7 @@ local function render_ui()
 
                                     imgui.PushID('ovr_enm_cdc_' .. q.name)
                                     if imgui.SmallButton('Clear CD') then
-                                        enm.ki_obtained_time = nil
-                                        enm.notified_ready = nil  -- reset alert flag so READY alert fires
+                                        set_enm_cooldown(ocd, q, nil)
                                         log(string.format('Manual override: %s [%s] cooldown cleared',
                                             q.name, override_selected_char))
                                         save_data()
@@ -3358,12 +3419,14 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
                 if zone_ok then
                     local cd = ensure_char(name)
                     if cd then
-                        if not cd.enms then cd.enms = {} end
-                        if not cd.enms[q.name] then cd.enms[q.name] = {} end
-                        cd.enms[q.name].ki_obtained_time = os.time()
-                        cd.enms[q.name].notified_ready = nil  -- clear alert flag so next expiry triggers a new notification
-                        local cooldown = q.enm_cooldown_days or 5
-                        log(string.format('%s obtained - %d day cooldown started.', q.name, cooldown))
+                        set_enm_cooldown(cd, q, os.time())
+                        if q.enm_resets_jst_daily then
+                            log(string.format('%s obtained - locked until JST midnight (%s).',
+                                q.name, format_time(next_jst_midnight(os.time()))))
+                        else
+                            log(string.format('%s obtained - %d day cooldown started.',
+                                q.name, q.enm_cooldown_days or 5))
+                        end
                         save_data()
                     end
                 end
