@@ -639,6 +639,57 @@ local ashu = {
 }
 
 -- ============================================================================
+-- Assault Rank Config
+-- ============================================================================
+-- Mercenary rank is the Wildcat badge key item held, one badge per rank
+-- (LSB xi.besieged.badges); weeklier shows the highest one held.
+--
+-- Promotion needs 25 rank-up points, a hidden server counter (LSB charVar
+-- 'AssaultPromotion'): +5 for clearing a mission for the first time, +1 for
+-- a repeat, nothing for a failure, back to 0 on promotion. The client is
+-- never sent it, so weeklier counts clears itself:
+--   * a clear is "You gain <n> Assault points!" inside an Assault zone - the
+--     line only a win prints;
+--   * first or repeat comes from the completed-missions bitmap in the Aht
+--     Urhgan "completed quests" block of 0x056 (port 0x00C0, words 4-7:
+--     mission m at bit 128 + m). The server only sets a mission's bit when
+--     the player reports back to Rytaal, after the points were awarded, so
+--     at the moment of the clear the bit still says whether this mission had
+--     been cleared before;
+--   * a promotion is the new badge's "Obtained key item: <abbr> Wildcat
+--     badge." line. Obtaining a badge is a promotion, and a chat line is only
+--     ever the current character's - a key item packet right after a
+--     character switch is not guaranteed to be (see check_packet_char_change).
+-- Stored on the character's assault record:
+--   rank       = 1-11 (index into ASSAULT_RANK_NAMES), nil = no badge seen
+--   rankup     = rank-up points, nil = unknown (set it in the Config tab)
+--   rankup_est = true once a clear could not be classified and counted +1
+local ASSAULT_RANK_BADGES = {
+    'PSC_WILDCAT_BADGE', 'PFC_WILDCAT_BADGE', 'SP_WILDCAT_BADGE', 'LC_WILDCAT_BADGE',
+    'C_WILDCAT_BADGE', 'S_WILDCAT_BADGE', 'SM_WILDCAT_BADGE', 'CS_WILDCAT_BADGE',
+    'SL_WILDCAT_BADGE', 'FL_WILDCAT_BADGE', 'CAPTAIN_WILDCAT_BADGE',
+}
+local ASSAULT_RANK_NAMES = {
+    'Private Second Class', 'Private First Class', 'Superior Private', 'Lance Corporal',
+    'Corporal', 'Sergeant', 'Sergeant Major', 'Chief Sergeant',
+    'Second Lieutenant', 'First Lieutenant', 'Captain',
+}
+-- The badge as "Obtained key item: <abbr> Wildcat badge." names it, lowercased.
+-- PSC, PFC and SP are verified from chatlogs; the rest follow the key item names.
+local ASSAULT_RANK_ABBR = {
+    psc = 1, pfc = 2, sp = 3, lc = 4, c = 5, s = 6, sm = 7, cs = 8, sl = 9, fl = 10, captain = 11,
+}
+local ASSAULT_RANKUP_NEEDED = 25
+-- Zones Assault missions are fought in (LSB zone ids).
+local ASSAULT_INSTANCE_ZONES = {
+    [55] = true,   -- Ilrusi Atoll
+    [56] = true,   -- Periqia
+    [63] = true,   -- Lebros Cavern
+    [66] = true,   -- Mamool Ja Training Grounds
+    [69] = true,   -- Leujaoam Sanctum
+}
+
+-- ============================================================================
 -- State
 -- ============================================================================
 local save_path                             -- set in load_cb (addon.path available then)
@@ -759,6 +810,13 @@ local ki_name_to_id = {}
 
 -- keyed by log_id, value = { [0]=u32, ... [7]=u32 }
 local active_quest_blocks = {}
+
+-- The 0x056 port carrying the completed Aht Urhgan quests; its words 4-7 hold
+-- every completed Assault mission (see Assault Rank Config).
+local QUEST_COMPLETE_PORT_AHT_URHGAN = 0x00C0
+-- That block for the current character, { [0]=u32, ... [7]=u32 }, or nil
+-- until the server has sent it this session.
+local completed_toau_block = nil
 
 local QUEST_OFFER_PORT_TO_LOG_ID = {
     [0x0050] = 0,   -- San d'Oria
@@ -1279,6 +1337,7 @@ local function clear_packet_state()
     ki_bitmap = {}
     prev_ki_bitmap = {}
     active_quest_blocks = {}
+    completed_toau_block = nil
     last_derived_status = {}
     dynamis_active_session = nil
     dlog('Cleared packet-derived state (character change).')
@@ -1997,6 +2056,94 @@ function ashu.on_zone(name, zone_id)
 end
 
 -- ============================================================================
+-- Assault Rank
+-- ============================================================================
+-- Whether `mission` had been cleared before, from the 0x056 completed block;
+-- nil when that block has not arrived this session or the mission is unknown.
+local function assault_cleared_before(mission)
+    if not completed_toau_block or not mission or mission <= 0 then return nil end
+    return is_bit_set_in_block(completed_toau_block, 128 + mission)
+end
+
+-- Mirrors the highest Wildcat badge held into the character's rank, for
+-- display only: it never touches the rank-up count (see Assault Rank Config).
+local function update_assault_rank(char_name, table_index)
+    local rank, in_table = nil, false
+    for i, ki_name in ipairs(ASSAULT_RANK_BADGES) do
+        local ki_id = resolve_ki_id(ki_name)
+        if ki_id and math.floor(ki_id / 512) == table_index then
+            in_table = true
+            if has_key_item(ki_id) then rank = i end
+        end
+    end
+    if not in_table or not rank then return end
+    local a = ensure_char_assault(ensure_char(char_name))
+    if a and a.rank ~= rank then
+        a.rank = rank
+        save_data()
+    end
+end
+
+-- "You gain <n> Assault points!" inside an Assault zone: +5 for a first
+-- clear, +1 for a repeat, +1 and estimated when it cannot be told.
+local function note_assault_clear(name, msg)
+    if not string.find(msg, 'you gain %d+ assault points?!') then return end
+    local zone = get_current_zone_id()
+    if not zone or not ASSAULT_INSTANCE_ZONES[zone] then return end
+    local a = ensure_char_assault(ensure_char(name))
+    if not a then return end
+    if a.rankup == nil then
+        log('Assault cleared - rank-up points are unknown; set them in the Config tab to start counting.')
+        return
+    end
+    local before = assault_cleared_before(a.current_assault)
+    local add = (before == false) and 5 or 1
+    if before == nil then a.rankup_est = true end
+    a.rankup = a.rankup + add
+    log(string.format('Assault cleared (%s): +%d rank-up point%s - %d/%d.',
+        before == nil and 'history unknown' or (before and 'repeat' or 'first time'),
+        add, add == 1 and '' or 's', a.rankup, ASSAULT_RANKUP_NEEDED))
+    save_data()
+end
+
+-- "Obtained key item: <abbr> Wildcat badge." - a promotion.
+local function note_assault_promotion(name, msg)
+    local abbr = string.match(msg, 'obtained key item: (%a+) wildcat badge')
+    local rank = abbr and ASSAULT_RANK_ABBR[abbr]
+    if not rank then return end
+    local a = ensure_char_assault(ensure_char(name))
+    if not a then return end
+    a.rank       = rank
+    a.rankup     = 0
+    a.rankup_est = nil
+    log(string.format('Promoted to %s - rank-up points restart at 0.', ASSAULT_RANK_NAMES[rank]))
+    save_data()
+end
+
+-- The 'Rank-up points' row: text and color.
+local function rankup_row(a)
+    if a and a.rank == #ASSAULT_RANK_NAMES then return 'Max rank', KI_COLOR_DIM end
+    if not a or a.rankup == nil then return 'Unknown - set in Config', KI_COLOR_DIM end
+    local est = a.rankup_est and '  (est.)' or ''
+    if a.rankup >= ASSAULT_RANKUP_NEEDED then
+        return string.format('%d / %d  - promotion ready (Naja Salaheem)%s',
+            a.rankup, ASSAULT_RANKUP_NEEDED, est), KI_COLOR_YES
+    end
+    return string.format('%d / %d  (%d to go)%s', a.rankup, ASSAULT_RANKUP_NEEDED,
+        ASSAULT_RANKUP_NEEDED - a.rankup, est), STATUS_COLORS['NEED TO COMPLETE']
+end
+
+-- Config tab buttons for the rank-up count, left to right.
+local RANKUP_OVERRIDES = {
+    { label = 'Unknown', apply = function(_) return nil end },
+    { label = 'Set 0',   apply = function(_) return 0 end },
+    { label = '-5',      apply = function(v) return math.max(0, (v or 0) - 5) end },
+    { label = '-1',      apply = function(v) return math.max(0, (v or 0) - 1) end },
+    { label = '+1',      apply = function(v) return (v or 0) + 1 end },
+    { label = '+5',      apply = function(v) return (v or 0) + 5 end },
+}
+
+-- ============================================================================
 -- EXP Band Inventory Scan
 -- ============================================================================
 -- Scans Inventory / Wardrobe / Wardrobe2 for any of the EXP band item IDs.
@@ -2376,11 +2523,11 @@ local function render_ui()
                     end
 
                     -- ==================================================
-                    -- ASSAULT TAGS SECTION (collapsible)
+                    -- ASSAULT SECTION (collapsible): tags, registration, rank
                     -- ==================================================
                     if not is_quest_hidden('Assault Tags') then
                         imgui.Spacing()
-                        if imgui.CollapsingHeader('Assault Tags', ImGuiTreeNodeFlags_DefaultOpen) then
+                        if imgui.CollapsingHeader('Assault', ImGuiTreeNodeFlags_DefaultOpen) then
                             -- The stock is one account-wide pool, so it reads
                             -- the same on every character's tab. Only the tag
                             -- in hand and the registration belong to this one.
@@ -2432,6 +2579,12 @@ local function render_ui()
                             rows[#rows + 1] = { 'Registered',
                                 reg > 0 and assault_mission_name(reg) or '-',
                                 reg > 0 and KI_COLOR_YES or KI_COLOR_DIM }
+
+                            local rank = a and a.rank
+                            rows[#rows + 1] = { 'Rank', rank and ASSAULT_RANK_NAMES[rank] or 'Unknown - log in once',
+                                rank and KI_COLOR_YES or KI_COLOR_DIM }
+                            local rankup_text, rankup_color = rankup_row(a)
+                            rows[#rows + 1] = { 'Rank-up points', rankup_text, rankup_color }
 
                             if pool then
                                 rows[#rows + 1] = { 'Last read',
@@ -2884,7 +3037,7 @@ local function render_ui()
                     end
                     imgui.PopID()
                     imgui.SameLine()
-                    imgui.Text('[Assault] Assault Tags (entire section)')
+                    imgui.Text('[Assault] Assault (entire section)')
                 end
 
                 -- Ashu Talif section
@@ -3117,6 +3270,25 @@ local function render_ui()
                                 end
                                 imgui.PopID()
                             end
+                        end
+
+                        -- ---- Assault rank-up points ----
+                        imgui.Spacing()
+                        if imgui.CollapsingHeader('Override: Assault rank-up points##ovr_rankup') then
+                            local oa = ensure_char_assault(ocd)
+                            imgui.Text('Rank-up points: ' .. (rankup_row(oa)))
+                            imgui.PushID('ovr_rankup')
+                            for i, b in ipairs(RANKUP_OVERRIDES) do
+                                if i > 1 then imgui.SameLine() end
+                                if imgui.SmallButton(b.label) then
+                                    oa.rankup     = b.apply(oa.rankup)
+                                    oa.rankup_est = nil
+                                    log(string.format('Manual override: rank-up points [%s] -> %s',
+                                        override_selected_char, tostring(oa.rankup)))
+                                    save_data()
+                                end
+                            end
+                            imgui.PopID()
                         end
 
                         -- ---- Ashu Talif (account-wide, this week) ----
@@ -3448,6 +3620,23 @@ ashita.events.register('command', 'weeklier_command_cb', function(e)
         log(string.format('  [ASHU] pending: %s', p and string.format('%s (paid in %s, result %s)',
             tostring(p.stage), tostring(p.week), tostring(p.result)) or 'none'))
 
+        -- Assault rank diagnostics
+        local ca = data[char] and data[char].assault or {}
+        log(string.format('  [ASSAULT] rank=%s rankup=%s est=%s registered=%s',
+            tostring(ca.rank), tostring(ca.rankup), tostring(ca.rankup_est), tostring(ca.current_assault)))
+        if completed_toau_block then
+            local done = {}
+            for m = 1, 127 do
+                if is_bit_set_in_block(completed_toau_block, 128 + m) then
+                    done[#done + 1] = string.format('%d %s', m, assault_mission_name(m))
+                end
+            end
+            log('  [ASSAULT] completed missions (0x056 port 0x00C0): ' ..
+                (#done > 0 and table.concat(done, ', ') or 'none'))
+        else
+            log('  [ASSAULT] completed missions: not received this session (zone once)')
+        end
+
         log('--- End Dump ---')
         return
     end
@@ -3702,6 +3891,8 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
     -- ToAU: Ashu Talif record
     -- ------------------------------------------------------------------
     ashu.on_chat(name, msg)
+    note_assault_clear(name, msg)
+    note_assault_promotion(name, msg)
 
     -- ------------------------------------------------------------------
     -- Eco Warrior flag_phrase detection
@@ -3911,6 +4102,11 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb', function(e)
         end
     end
 
+    -- Mercenary rank from the Wildcat badges (display only)
+    if char_name then
+        update_assault_rank(char_name, table_index)
+    end
+
     -- Detect KI removals (ki_quest_incomplete -> COMPLETED, ki_quest_active -> READY TO TURN IN or COMPLETED)
     if prev_ki_bitmap[table_index] then
         process_ki_removals(table_index)
@@ -3935,6 +4131,12 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_056_active_quests', f
 
     -- Port at offset 0x24 (uint16 LE)
     local port = u16le(pkt, 0x24 + 1)
+
+    if port == QUEST_COMPLETE_PORT_AHT_URHGAN then
+        completed_toau_block = read_u32x8(pkt)
+        return
+    end
+
     local log_id = QUEST_OFFER_PORT_TO_LOG_ID[port]
     if log_id == nil then
         return
