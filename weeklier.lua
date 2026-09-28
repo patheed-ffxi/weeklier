@@ -610,6 +610,12 @@ local function set_quest_hidden(quest_name, hide)
     data._hidden = hidden_quests
 end
 
+-- Top-level save keys that are not characters: UI preferences, settings and
+-- the account-wide records (the Assault tag stock and the Ashu Talif week).
+local function is_char_key(name)
+    return name ~= '_hidden' and name ~= '_settings' and name ~= '_assault' and name ~= '_ashu'
+end
+
 -- Kill-mob tracking: when we see "defeats the X", we store the quest indices
 -- and a timestamp. If an XP message arrives within KILL_CONFIRM_WINDOW we
 -- advance those quests to COMPLETED.
@@ -947,7 +953,7 @@ local function load_data()
     -- and the registration that genuinely are per character.
     local adopted
     for cname, cdata in pairs(data) do
-        if cname ~= '_hidden' and cname ~= '_settings' and cname ~= '_assault'
+        if is_char_key(cname)
             and type(cdata) == 'table' and type(cdata.assault) == 'table'
             and cdata.assault.updated ~= nil then
             local a = cdata.assault
@@ -1996,11 +2002,10 @@ local function render_ui()
         imgui.Separator()
 
         -- Collect character names sorted alphabetically, current char first
-        -- Filter out the _hidden / _settings / _assault keys, which are not
-        -- characters
+        -- Filter out the keys that are not characters (see is_char_key)
         local char_names = {}
         for name, _ in pairs(data) do
-            if name ~= '_hidden' and name ~= '_settings' and name ~= '_assault' then
+            if is_char_key(name) then
                 char_names[#char_names + 1] = name
             end
         end
@@ -2627,8 +2632,7 @@ local function render_ui()
                 -- Build character list
                 local override_chars = {}
                 for cname, cdata in pairs(data) do
-                    if cname ~= '_hidden' and cname ~= '_settings' and cname ~= '_assault'
-                        and type(cdata) == 'table' then
+                    if is_char_key(cname) and type(cdata) == 'table' then
                         override_chars[#override_chars + 1] = cname
                     end
                 end
@@ -2917,8 +2921,7 @@ ashita.events.register('load', 'weeklier_load_cb', function()
     -- Normalize every stored character so weekly rollover resets apply even
     -- to characters that haven't logged in since the reset.
     for cname, cdata in pairs(data) do
-        if cname ~= '_hidden' and cname ~= '_settings' and cname ~= '_assault'
-            and type(cdata) == 'table' then
+        if is_char_key(cname) and type(cdata) == 'table' then
             ensure_char(cname)
         end
     end
