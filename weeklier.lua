@@ -3165,7 +3165,7 @@ local function render_ui()
                                     if imgui.SmallButton('Start CD') then
                                         set_enm_cooldown(ocd, q, os.time())
                                         log(string.format('Manual override: %s [%s] cooldown started now',
-                                            q.name, override_selected_char))
+                                            q.cooldown_group or q.name, override_selected_char))
                                         save_data()
                                     end
                                     imgui.PopID()
@@ -3175,7 +3175,7 @@ local function render_ui()
                                     if imgui.SmallButton('Clear CD') then
                                         set_enm_cooldown(ocd, q, nil)
                                         log(string.format('Manual override: %s [%s] cooldown cleared',
-                                            q.name, override_selected_char))
+                                            q.cooldown_group or q.name, override_selected_char))
                                         save_data()
                                     end
                                     imgui.PopID()
@@ -3304,6 +3304,13 @@ local function render_ui()
                                 imgui.PushID('ovr_ashu_won_' .. s.key)
                                 if imgui.SmallButton('Mark won') then
                                     ashu.record(s.key, 'won', override_selected_char)
+                                    -- Settle the character's own paid stage too, or its
+                                    -- pending gate stays open and credits the next ship
+                                    -- win (e.g. The Black Coffin) to this stage.
+                                    local p = ocd.ashu_pending
+                                    if p and p.stage == s.key then
+                                        p.result = 'won'
+                                    end
                                     log(string.format('Manual override: Ashu Talif %s won by %s',
                                         s.name, override_selected_char))
                                     save_data()
@@ -3888,7 +3895,7 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
     end
 
     -- ------------------------------------------------------------------
-    -- ToAU: Ashu Talif record
+    -- ToAU: Ashu Talif record, Assault clears and promotions
     -- ------------------------------------------------------------------
     ashu.on_chat(name, msg)
     note_assault_clear(name, msg)

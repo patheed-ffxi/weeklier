@@ -213,7 +213,7 @@ Click the `x` button next to any quest in the UI to hide it. Hidden quests can b
 
 ### Manual Status Override
 
-The Config tab provides a manual status override for any quest, ENM / Limbus, Eco Warrior nation, or Dynamis entry. This is useful for bootstrapping data on characters that have already completed content before installing the addon.
+The Config tab provides a manual status override for any quest, ENM / Limbus / ISNM cooldown, Eco Warrior nation, Dynamis entry, Assault rank-up points, or this week's Ashu Talif stages. This is useful for bootstrapping data on characters that have already completed content before installing the addon.
 
 ## Data Storage
 
