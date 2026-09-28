@@ -600,6 +600,45 @@ local function assault_mission_area(id)
 end
 
 -- ============================================================================
+-- Ashu Talif Config
+-- ============================================================================
+-- Halshaob's three quests in Nashmau, fought in turn on The Ashu Talif:
+-- Scouting the Ashu Talif (3 Imperial bronze pieces), Royal Painter Escort
+-- (1 silver) and Targeting the Captain (1 mythril). Horizon runs the chain
+-- once a week, resetting with the weekly reset, and once per ACCOUNT - so the
+-- week's record is kept once, in data._ashu, and shown on every tab:
+--   data._ashu = {
+--     week   = week key the record belongs to (emptied when the week moves on)
+--     stages = { [stage key] = { status = 'paid'|'won'|'failed', by = char, at = unix } }
+--   }
+-- Stage keys are strings on purpose: json.lua refuses a sparse array, which a
+-- numerically keyed table holding only stage 2 would be.
+-- The stage a character has paid for and not finished is its own:
+--   data[char].ashu_pending = { stage = key, week = week paid in, result = nil|'won'|'failed' }
+-- It survives the weekly reset, as a paid quest does in game.
+--
+-- Detected from chat (the quest name sits between the client's quote glyphs,
+-- which the match leaves out):
+--   paid   : Halshaob's "...in exchange fer lettin' you take on <quest>."
+--   won    : "Objective complete. You may return on the lifeboat."  (on the ship)
+--   failed : "The mission has failed. Leaving area."                (on the ship)
+-- A failure is final on Horizon, so it overrides an objective-complete line
+-- from the same run. Win and fail lines only count for a character with a
+-- stage pending, which keeps The Black Coffin and the COR quest - also fought
+-- on the ship - out of the record.
+local ashu = {
+    ZONE_ID       = 60,     -- The Ashu Talif
+    STAGES        = {
+        { key = 'scouting', name = 'Scouting the Ashu Talif' },
+        { key = 'painter',  name = 'Royal Painter Escort' },
+        { key = 'captain',  name = 'Targeting the Captain' },
+    },
+    PAID_PHRASE   = "in exchange fer lettin' you take on",
+    WON_PHRASE    = 'objective complete. you may return on the lifeboat',
+    FAILED_PHRASE = 'the mission has failed',
+}
+
+-- ============================================================================
 -- State
 -- ============================================================================
 local save_path                             -- set in load_cb (addon.path available then)
@@ -1869,6 +1908,95 @@ local function note_assault_tag_drawn(a)
 end
 
 -- ============================================================================
+-- Ashu Talif
+-- ============================================================================
+ashu.STATUS = {
+    paid   = { label = 'Paid',   color = STATUS_COLORS['NEED TO COMPLETE'] },
+    won    = { label = 'Won',    color = KI_COLOR_YES },
+    failed = { label = 'Failed', color = KI_COLOR_NO },
+}
+
+-- This week's account-wide record. A record left from an earlier week is
+-- replaced by an empty one: the chain resets with the weekly reset.
+function ashu.week()
+    local week = get_week_key()
+    local r = data._ashu
+    if type(r) ~= 'table' or r.week ~= week then
+        r = { week = week, stages = {} }
+        data._ashu = r
+    end
+    if type(r.stages) ~= 'table' then r.stages = {} end
+    return r
+end
+
+function ashu.stage(key)
+    for _, s in ipairs(ashu.STAGES) do
+        if s.key == key then return s end
+    end
+    return nil
+end
+
+-- Records a stage's status in this week's record, credited to char_name now.
+function ashu.record(key, status, char_name)
+    ashu.week().stages[key] = { status = status, by = char_name, at = os.time() }
+end
+
+-- OWNER DECISION (open): Horizon allows the chain once per week per account,
+-- but whether the first payment, the final win or each stage is what locks
+-- the other characters has not been decided. Until it is, nothing is
+-- claimed: return a short note (e.g. 'Locked this week') to show one on
+-- char_name's tab.
+function ashu.lock_note(char_name, week_record)
+    return nil
+end
+
+-- Chat for the current character (normalized, not injected).
+function ashu.on_chat(name, msg)
+    if string.find(msg, ashu.PAID_PHRASE, 1, true) then
+        for _, s in ipairs(ashu.STAGES) do
+            if string.find(msg, normalize_string(s.name), 1, true) then
+                local cd = ensure_char(name)
+                if not cd then return end
+                cd.ashu_pending = { stage = s.key, week = get_week_key() }
+                ashu.record(s.key, 'paid', name)
+                log(string.format('Ashu Talif: %s paid for %s.', name, s.name))
+                save_data()
+                return
+            end
+        end
+        return
+    end
+
+    local won    = string.find(msg, ashu.WON_PHRASE, 1, true) ~= nil
+    local failed = string.find(msg, ashu.FAILED_PHRASE, 1, true) ~= nil
+    if not won and not failed then return end
+    if get_current_zone_id() ~= ashu.ZONE_ID then return end
+
+    local cd = data[name]
+    local p  = cd and cd.ashu_pending
+    if not p or not p.stage then return end
+    if won and p.result == 'failed' then return end   -- a failure is final
+
+    p.result = failed and 'failed' or 'won'
+    ashu.record(p.stage, p.result, name)
+    local s = ashu.stage(p.stage)
+    log(string.format('Ashu Talif: %s %s.', s and s.name or tostring(p.stage), p.result))
+    save_data()
+end
+
+-- Zone-in for the current character. Leaving the ship once the run has a
+-- result closes the pending stage; leaving without one keeps it, since what
+-- Horizon does with an abandoned run is not known.
+function ashu.on_zone(name, zone_id)
+    if zone_id == ashu.ZONE_ID then return end
+    local cd = data[name]
+    if cd and cd.ashu_pending and cd.ashu_pending.result then
+        cd.ashu_pending = nil
+        save_data()
+    end
+end
+
+-- ============================================================================
 -- EXP Band Inventory Scan
 -- ============================================================================
 -- Scans Inventory / Wardrobe / Wardrobe2 for any of the EXP band item IDs.
@@ -2341,6 +2469,88 @@ local function render_ui()
                     end
 
                     -- ==================================================
+                    -- ASHU TALIF SECTION (collapsible, account-wide)
+                    -- ==================================================
+                    if not is_quest_hidden('Ashu Talif') then
+                        imgui.Spacing()
+                        if imgui.CollapsingHeader('Ashu Talif (account, weekly)', ImGuiTreeNodeFlags_DefaultOpen) then
+                            -- One record for the whole account, so every tab
+                            -- shows the same rows.
+                            local week_rec = ashu.week()
+
+                            imgui.Columns(5, '##ashuCols', true)
+                            imgui.SetColumnWidth(0, 30)
+                            imgui.SetColumnWidth(1, 180)
+                            imgui.SetColumnWidth(2, 70)
+                            imgui.SetColumnWidth(3, 100)
+                            imgui.Text('')
+                            imgui.NextColumn()
+                            imgui.Text('Stage')
+                            imgui.NextColumn()
+                            imgui.Text('Status')
+                            imgui.NextColumn()
+                            imgui.Text('By')
+                            imgui.NextColumn()
+                            imgui.Text('When')
+                            imgui.NextColumn()
+                            imgui.Separator()
+
+                            for i, s in ipairs(ashu.STAGES) do
+                                -- Hide button (only on first row)
+                                if i == 1 then
+                                    imgui.PushID('hide_ashu')
+                                    if imgui.SmallButton('x') then
+                                        set_quest_hidden('Ashu Talif', true)
+                                        save_data()
+                                    end
+                                    imgui.PopID()
+                                else
+                                    imgui.Text('')
+                                end
+                                imgui.NextColumn()
+
+                                imgui.Text(s.name)
+                                imgui.NextColumn()
+
+                                local st    = week_rec.stages[s.key]
+                                local shown = st and ashu.STATUS[st.status]
+                                if shown then
+                                    imgui.TextColored(shown.color, shown.label)
+                                    imgui.NextColumn()
+                                    imgui.Text(st.by or '?')
+                                    imgui.NextColumn()
+                                    imgui.Text(format_time(st.at))
+                                else
+                                    imgui.TextColored(KI_COLOR_DIM, '-')
+                                    imgui.NextColumn()
+                                    imgui.Text('')
+                                    imgui.NextColumn()
+                                    imgui.Text('')
+                                end
+                                imgui.NextColumn()
+                            end
+
+                            imgui.Columns(1)
+
+                            -- A stage paid in an earlier week and not fought
+                            -- yet is still owed a fight.
+                            for _, other in ipairs(char_names) do
+                                local p = data[other] and data[other].ashu_pending
+                                if p and not p.result and p.week ~= week_rec.week then
+                                    local s = ashu.stage(p.stage)
+                                    imgui.TextColored(KI_COLOR_DIM, string.format('%s: %s paid in %s, not fought yet',
+                                        other, s and s.name or tostring(p.stage), tostring(p.week)))
+                                end
+                            end
+
+                            local note = ashu.lock_note(char_name, week_rec)
+                            if note then
+                                imgui.TextColored(KI_COLOR_NO, note)
+                            end
+                        end
+                    end
+
+                    -- ==================================================
                     -- ENM / LIMBUS SECTION (collapsible)
                     -- ==================================================
                     if #enm_quests > 0 then
@@ -2677,6 +2887,19 @@ local function render_ui()
                     imgui.Text('[Assault] Assault Tags (entire section)')
                 end
 
+                -- Ashu Talif section
+                if is_quest_hidden('Ashu Talif') then
+                    any_hidden = true
+                    imgui.PushID('show_ashu_section')
+                    if imgui.SmallButton('Show') then
+                        set_quest_hidden('Ashu Talif', false)
+                        save_data()
+                    end
+                    imgui.PopID()
+                    imgui.SameLine()
+                    imgui.Text('[Ashu Talif] Ashu Talif (entire section)')
+                end
+
                 if not any_hidden then
                     imgui.TextColored({ 0.5, 0.5, 0.5, 1.0 }, 'No hidden quests.')
                 end
@@ -2891,6 +3114,36 @@ local function render_ui()
                                             ew.nation, override_selected_char, ovr_week))
                                         save_data()
                                     end
+                                end
+                                imgui.PopID()
+                            end
+                        end
+
+                        -- ---- Ashu Talif (account-wide, this week) ----
+                        imgui.Spacing()
+                        if imgui.CollapsingHeader('Override: Ashu Talif (this week)##ovr_ashu') then
+                            local week_rec = ashu.week()
+                            for _, s in ipairs(ashu.STAGES) do
+                                local st = week_rec.stages[s.key]
+                                imgui.Text(string.format('%s: %s', s.name,
+                                    st and string.format('%s by %s', st.status, st.by or '?') or '-'))
+                                imgui.SameLine()
+
+                                imgui.PushID('ovr_ashu_won_' .. s.key)
+                                if imgui.SmallButton('Mark won') then
+                                    ashu.record(s.key, 'won', override_selected_char)
+                                    log(string.format('Manual override: Ashu Talif %s won by %s',
+                                        s.name, override_selected_char))
+                                    save_data()
+                                end
+                                imgui.PopID()
+                                imgui.SameLine()
+
+                                imgui.PushID('ovr_ashu_clr_' .. s.key)
+                                if imgui.SmallButton('Clear') then
+                                    week_rec.stages[s.key] = nil
+                                    log(string.format('Manual override: Ashu Talif %s cleared', s.name))
+                                    save_data()
                                 end
                                 imgui.PopID()
                             end
@@ -3184,6 +3437,17 @@ ashita.events.register('command', 'weeklier_command_cb', function(e)
                 i, entry.zone or '??', entry.zone_id or 0, format_time(entry.time)))
         end
 
+        -- Ashu Talif diagnostics
+        local week_rec = ashu.week()
+        for _, s in ipairs(ashu.STAGES) do
+            local st = week_rec.stages[s.key]
+            log(string.format('  [ASHU] %s: %s', s.name, st and string.format('%s by %s (%s)',
+                st.status, st.by or '?', format_time(st.at)) or '-'))
+        end
+        local p = data[char] and data[char].ashu_pending
+        log(string.format('  [ASHU] pending: %s', p and string.format('%s (paid in %s, result %s)',
+            tostring(p.stage), tostring(p.week), tostring(p.result)) or 'none'))
+
         log('--- End Dump ---')
         return
     end
@@ -3433,6 +3697,11 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
             end
         end
     end
+
+    -- ------------------------------------------------------------------
+    -- ToAU: Ashu Talif record
+    -- ------------------------------------------------------------------
+    ashu.on_chat(name, msg)
 
     -- ------------------------------------------------------------------
     -- Eco Warrior flag_phrase detection
@@ -3816,6 +4085,20 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e
     }
     persist_dynamis_session()
     dlog(string.format('Initialized Dynamis session: %s (placeholder expiry in 120s).', zone_name))
+end)
+
+-- ============================================================================
+-- Zone-In Packet (0x00A) - Ashu Talif runs
+-- ============================================================================
+-- Kept apart from the Dynamis handler above, which returns early for every
+-- zone that is not a Dynamis one.
+ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_ashu', function(e)
+    if e.id ~= 0x00A then return end
+    local pkt = e.data
+    if not pkt or #pkt < 0x34 then return end
+    local name = get_current_char_name()
+    if not name then return end
+    ashu.on_zone(name, u32le(pkt, 0x30 + 1))   -- ZoneNo, as the Dynamis handler reads it
 end)
 
 -- ============================================================================
