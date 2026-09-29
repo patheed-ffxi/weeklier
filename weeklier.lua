@@ -191,6 +191,44 @@ local QUESTS = {
         ki_quest_active         = 'LETTER_FROM_THE_MITHRAN_TRACKERS',
         ki_active_is_completion = true,
     },
+    -- -----------------------------------------------------------------------
+    -- The Cooldowns table draws its rows in this order, so the daily ToAU
+    -- rows - Assault tag and ISNM orders - come first.
+    --
+    -- ToAU: Imperial Army I.D. tags for Assault / Nyzul Isle. A new tag can
+    -- be obtained 24 hours (Earth time) after the previous one was issued -
+    -- the timer runs from receiving the tag, not from using it.
+    -- -----------------------------------------------------------------------
+    {
+        name                = 'Assault Tag (Imperial I.D.)',
+        type                = 'enm',
+        ki_quest_active     = 'IMPERIAL_ARMY_ID_TAG',
+        ki_display_name     = 'Imperial Army I.D. tag',
+        enm_cooldown_days   = 1,
+    },
+    -- -----------------------------------------------------------------------
+    -- ToAU: ISNM orders from Shajaf (Aht Urhgan Whitegate). 2000 Imperial
+    -- Standing buys a Confidential Imperial order (the level-60 fights), 3000
+    -- a Secret Imperial order (uncapped). A character can buy one order per
+    -- JST day, whichever it is, so the two rows share one lock that lifts at
+    -- the next JST midnight.
+    -- -----------------------------------------------------------------------
+    {
+        name                 = 'ISNM Order (2000)',
+        type                 = 'enm',
+        ki_quest_active      = 'CONFIDENTIAL_IMPERIAL_ORDER',
+        ki_display_name      = 'Confidential Imperial order',
+        enm_resets_jst_daily = true,
+        cooldown_group       = 'ISNM Orders',
+    },
+    {
+        name                 = 'ISNM Order (3000)',
+        type                 = 'enm',
+        ki_quest_active      = 'SECRET_IMPERIAL_ORDER',
+        ki_display_name      = 'Secret Imperial order',
+        enm_resets_jst_daily = true,
+        cooldown_group       = 'ISNM Orders',
+    },
     {
         name                = 'Limbus - Cosmo Cleanse',
         type                = 'enm',
@@ -282,41 +320,6 @@ local QUESTS = {
         obtain_phrase       = 'Obtained: Page from the Dragon Chronicles',
         obtain_zones        = HAAP_ZONES,
         enm_cooldown_days   = 1,
-    },
-    -- -----------------------------------------------------------------------
-    -- ToAU: Imperial Army I.D. tags for Assault / Nyzul Isle. A new tag can
-    -- be obtained 24 hours (Earth time) after the previous one was issued -
-    -- the timer runs from receiving the tag, not from using it.
-    -- -----------------------------------------------------------------------
-    {
-        name                = 'Assault Tag (Imperial I.D.)',
-        type                = 'enm',
-        ki_quest_active     = 'IMPERIAL_ARMY_ID_TAG',
-        ki_display_name     = 'Imperial Army I.D. tag',
-        enm_cooldown_days   = 1,
-    },
-    -- -----------------------------------------------------------------------
-    -- ToAU: ISNM orders from Shajaf (Aht Urhgan Whitegate). 2000 Imperial
-    -- Standing buys a Confidential Imperial order (the level-60 fights), 3000
-    -- a Secret Imperial order (uncapped). A character can buy one order per
-    -- JST day, whichever it is, so the two rows share one lock that lifts at
-    -- the next JST midnight.
-    -- -----------------------------------------------------------------------
-    {
-        name                 = 'ISNM Order (2000)',
-        type                 = 'enm',
-        ki_quest_active      = 'CONFIDENTIAL_IMPERIAL_ORDER',
-        ki_display_name      = 'Confidential Imperial order',
-        enm_resets_jst_daily = true,
-        cooldown_group       = 'ISNM Orders',
-    },
-    {
-        name                 = 'ISNM Order (3000)',
-        type                 = 'enm',
-        ki_quest_active      = 'SECRET_IMPERIAL_ORDER',
-        ki_display_name      = 'Secret Imperial order',
-        enm_resets_jst_daily = true,
-        cooldown_group       = 'ISNM Orders',
     },
     -- -----------------------------------------------------------------------
     -- Kill-based quest: no flag or turn-in, just kill the mob and get XP.
