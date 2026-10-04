@@ -2136,15 +2136,10 @@ local function rankup_row(a)
         ASSAULT_RANKUP_NEEDED - a.rankup, est), STATUS_COLORS['NEED TO COMPLETE']
 end
 
--- Config tab buttons for the rank-up count, left to right.
-local RANKUP_OVERRIDES = {
-    { label = 'Unknown', apply = function(_) return nil end },
-    { label = 'Set 0',   apply = function(_) return 0 end },
-    { label = '-5',      apply = function(v) return math.max(0, (v or 0) - 5) end },
-    { label = '-1',      apply = function(v) return math.max(0, (v or 0) - 1) end },
-    { label = '+1',      apply = function(v) return (v or 0) + 1 end },
-    { label = '+5',      apply = function(v) return (v or 0) + 5 end },
-}
+-- The Config tab's rank-up number box ({ value }, as imgui.InputInt takes
+-- it). It shows -1 while the count is unknown: InputInt only reports an edit
+-- when the number changes, so an unknown shown as 0 could never be set to 0.
+local rankup_input = { -1 }
 
 -- ============================================================================
 -- EXP Band Inventory Scan
@@ -3279,19 +3274,33 @@ local function render_ui()
                         imgui.Spacing()
                         if imgui.CollapsingHeader('Override: Assault rank-up points##ovr_rankup') then
                             local oa = ensure_char_assault(ocd)
-                            imgui.Text('Rank-up points: ' .. (rankup_row(oa)))
+                            imgui.Text('Rank-up points: ' .. (oa.rankup == nil and 'Unknown' or (rankup_row(oa))))
+
+                            -- Type the value and press Enter (the box's -/+
+                            -- step by 1, or 5 with Ctrl). A negative value, or
+                            -- the Unknown button, forgets the count.
+                            local set, changed = oa.rankup, false
+                            rankup_input[1] = oa.rankup or -1
                             imgui.PushID('ovr_rankup')
-                            for i, b in ipairs(RANKUP_OVERRIDES) do
-                                if i > 1 then imgui.SameLine() end
-                                if imgui.SmallButton(b.label) then
-                                    oa.rankup     = b.apply(oa.rankup)
-                                    oa.rankup_est = nil
-                                    log(string.format('Manual override: rank-up points [%s] -> %s',
-                                        override_selected_char, tostring(oa.rankup)))
-                                    save_data()
-                                end
+                            imgui.PushItemWidth(110)
+                            if imgui.InputInt('##rankup_value', rankup_input, 1, 5, ImGuiInputTextFlags_EnterReturnsTrue) then
+                                set, changed = rankup_input[1] >= 0 and rankup_input[1] or nil, true
+                            end
+                            imgui.PopItemWidth()
+                            imgui.SameLine()
+                            if imgui.SmallButton('Unknown') then
+                                set, changed = nil, true
                             end
                             imgui.PopID()
+                            imgui.TextColored(KI_COLOR_DIM, 'Type the value and press Enter; -1 means unknown.')
+
+                            if changed then
+                                oa.rankup     = set
+                                oa.rankup_est = nil
+                                log(string.format('Manual override: rank-up points [%s] -> %s',
+                                    override_selected_char, tostring(oa.rankup)))
+                                save_data()
+                            end
                         end
 
                         -- ---- Ashu Talif (account-wide, this week) ----

@@ -150,7 +150,7 @@ Save files written before 1.6 kept a stock on each character. They are migrated 
 - First or repeat comes from the list of completed missions the server sends with the quest log. If that list or the registered mission is unknown, the clear counts +1 and the value is marked `(est.)`.
 - A promotion - the new badge's "Obtained key item" line - restarts the count at 0.
 
-The starting value cannot be read from the game, so the row shows `Unknown - set in Config` until you enter it in the Config tab (buttons for Unknown, Set 0, -5, -1, +1 and +5). Once set, it stays correct from clears and promotions. At 25 or more the row reads `promotion ready (Naja Salaheem)`.
+The starting value cannot be read from the game, so the row shows `Unknown - set in Config` until you enter it in the Config tab: type the value into the box and press Enter (the box's -/+ step it by 1, or by 5 with Ctrl; -1 or the Unknown button forgets it). Once set, it stays correct from clears and promotions. At 25 or more the row reads `promotion ready (Naja Salaheem)`.
 
 ## Detection Methods
 
