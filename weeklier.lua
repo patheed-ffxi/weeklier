@@ -100,6 +100,14 @@ end
 --                         reward HAAP pages) and must not start the cooldown.
 --   enm_cooldown_days   : Number of real days for the cooldown (default 5 for ENMs,
 --                         3 for Limbus, 1 for HAAP pages and Assault tags).
+--   enm_resets_jst_daily : optional. When true the cooldown lifts at the first
+--                         JST midnight (15:00 UTC) after obtaining instead of
+--                         after enm_cooldown_days (ISNM orders).
+--   cooldown_group      : optional name shared by rows that are one server-side
+--                         lock shown once per key item (the two ISNM orders).
+--                         Obtaining any row's reward starts every row in the
+--                         group, the Config buttons act on the whole group, and
+--                         the ready alert names the group once.
 --   These are displayed in their own cooldown section in the UI, separate from
 --   weekly quests. Cooldown data is NOT reset on weekly rollover - it uses its
 --   own timer.
@@ -182,6 +190,44 @@ local QUESTS = {
         name                    = 'Requiem of Sin',
         ki_quest_active         = 'LETTER_FROM_THE_MITHRAN_TRACKERS',
         ki_active_is_completion = true,
+    },
+    -- -----------------------------------------------------------------------
+    -- The Cooldowns table draws its rows in this order, so the daily ToAU
+    -- rows - Assault tag and ISNM orders - come first.
+    --
+    -- ToAU: Imperial Army I.D. tags for Assault / Nyzul Isle. A new tag can
+    -- be obtained 24 hours (Earth time) after the previous one was issued -
+    -- the timer runs from receiving the tag, not from using it.
+    -- -----------------------------------------------------------------------
+    {
+        name                = 'Assault Tag (Imperial I.D.)',
+        type                = 'enm',
+        ki_quest_active     = 'IMPERIAL_ARMY_ID_TAG',
+        ki_display_name     = 'Imperial Army I.D. tag',
+        enm_cooldown_days   = 1,
+    },
+    -- -----------------------------------------------------------------------
+    -- ToAU: ISNM orders from Shajaf (Aht Urhgan Whitegate). 2000 Imperial
+    -- Standing buys a Confidential Imperial order (the level-60 fights), 3000
+    -- a Secret Imperial order (uncapped). A character can buy one order per
+    -- JST day, whichever it is, so the two rows share one lock that lifts at
+    -- the next JST midnight.
+    -- -----------------------------------------------------------------------
+    {
+        name                 = 'ISNM Order (2000)',
+        type                 = 'enm',
+        ki_quest_active      = 'CONFIDENTIAL_IMPERIAL_ORDER',
+        ki_display_name      = 'Confidential Imperial order',
+        enm_resets_jst_daily = true,
+        cooldown_group       = 'ISNM Orders',
+    },
+    {
+        name                 = 'ISNM Order (3000)',
+        type                 = 'enm',
+        ki_quest_active      = 'SECRET_IMPERIAL_ORDER',
+        ki_display_name      = 'Secret Imperial order',
+        enm_resets_jst_daily = true,
+        cooldown_group       = 'ISNM Orders',
     },
     {
         name                = 'Limbus - Cosmo Cleanse',
@@ -273,18 +319,6 @@ local QUESTS = {
         type                = 'enm',
         obtain_phrase       = 'Obtained: Page from the Dragon Chronicles',
         obtain_zones        = HAAP_ZONES,
-        enm_cooldown_days   = 1,
-    },
-    -- -----------------------------------------------------------------------
-    -- ToAU: Imperial Army I.D. tags for Assault / Nyzul Isle. A new tag can
-    -- be obtained 24 hours (Earth time) after the previous one was issued -
-    -- the timer runs from receiving the tag, not from using it.
-    -- -----------------------------------------------------------------------
-    {
-        name                = 'Assault Tag (Imperial I.D.)',
-        type                = 'enm',
-        ki_quest_active     = 'IMPERIAL_ARMY_ID_TAG',
-        ki_display_name     = 'Imperial Army I.D. tag',
         enm_cooldown_days   = 1,
     },
     -- -----------------------------------------------------------------------
@@ -569,6 +603,96 @@ local function assault_mission_area(id)
 end
 
 -- ============================================================================
+-- Ashu Talif Config
+-- ============================================================================
+-- Halshaob's three quests in Nashmau, fought in turn on The Ashu Talif:
+-- Scouting the Ashu Talif (3 Imperial bronze pieces), Royal Painter Escort
+-- (1 silver) and Targeting the Captain (1 mythril). Horizon runs the chain
+-- once a week, resetting with the weekly reset, and once per ACCOUNT - so the
+-- week's record is kept once, in data._ashu, and shown on every tab:
+--   data._ashu = {
+--     week   = week key the record belongs to (emptied when the week moves on)
+--     stages = { [stage key] = { status = 'paid'|'won'|'failed', by = char, at = unix } }
+--   }
+-- Stage keys are strings on purpose: json.lua refuses a sparse array, which a
+-- numerically keyed table holding only stage 2 would be.
+-- The stage a character has paid for and not finished is its own:
+--   data[char].ashu_pending = { stage = key, week = week paid in, result = nil|'won'|'failed' }
+-- It survives the weekly reset, as a paid quest does in game.
+--
+-- Detected from chat (the quest name sits between the client's quote glyphs,
+-- which the match leaves out):
+--   paid   : Halshaob's "...in exchange fer lettin' you take on <quest>."
+--   won    : "Objective complete. You may return on the lifeboat."  (on the ship)
+--   failed : "The mission has failed. Leaving area."                (on the ship)
+-- A failure is final on Horizon, so it overrides an objective-complete line
+-- from the same run. Win and fail lines only count for a character with a
+-- stage pending, which keeps The Black Coffin and the COR quest - also fought
+-- on the ship - out of the record.
+local ashu = {
+    ZONE_ID       = 60,     -- The Ashu Talif
+    STAGES        = {
+        { key = 'scouting', name = 'Scouting the Ashu Talif' },
+        { key = 'painter',  name = 'Royal Painter Escort' },
+        { key = 'captain',  name = 'Targeting the Captain' },
+    },
+    PAID_PHRASE   = "in exchange fer lettin' you take on",
+    WON_PHRASE    = 'objective complete. you may return on the lifeboat',
+    FAILED_PHRASE = 'the mission has failed',
+}
+
+-- ============================================================================
+-- Assault Rank Config
+-- ============================================================================
+-- Mercenary rank is the Wildcat badge key item held, one badge per rank
+-- (LSB xi.besieged.badges); weeklier shows the highest one held.
+--
+-- Promotion needs 25 rank-up points, a hidden server counter (LSB charVar
+-- 'AssaultPromotion'): +5 for clearing a mission for the first time, +1 for
+-- a repeat, nothing for a failure, back to 0 on promotion. The client is
+-- never sent it, so weeklier counts clears itself:
+--   * a clear is "You gain <n> Assault points!" inside an Assault zone - the
+--     line only a win prints;
+--   * first or repeat comes from the completed-missions bitmap in the Aht
+--     Urhgan "completed quests" block of 0x056 (port 0x00C0, words 4-7:
+--     mission m at bit 128 + m). The server only sets a mission's bit when
+--     the player reports back to Rytaal, after the points were awarded, so
+--     at the moment of the clear the bit still says whether this mission had
+--     been cleared before;
+--   * a promotion is the new badge's "Obtained key item: <abbr> Wildcat
+--     badge." line. Obtaining a badge is a promotion, and a chat line is only
+--     ever the current character's - a key item packet right after a
+--     character switch is not guaranteed to be (see check_packet_char_change).
+-- Stored on the character's assault record:
+--   rank       = 1-11 (index into ASSAULT_RANK_NAMES), nil = no badge seen
+--   rankup     = rank-up points, nil = unknown (set it in the Config tab)
+--   rankup_est = true once a clear could not be classified and counted +1
+local ASSAULT_RANK_BADGES = {
+    'PSC_WILDCAT_BADGE', 'PFC_WILDCAT_BADGE', 'SP_WILDCAT_BADGE', 'LC_WILDCAT_BADGE',
+    'C_WILDCAT_BADGE', 'S_WILDCAT_BADGE', 'SM_WILDCAT_BADGE', 'CS_WILDCAT_BADGE',
+    'SL_WILDCAT_BADGE', 'FL_WILDCAT_BADGE', 'CAPTAIN_WILDCAT_BADGE',
+}
+local ASSAULT_RANK_NAMES = {
+    'Private Second Class', 'Private First Class', 'Superior Private', 'Lance Corporal',
+    'Corporal', 'Sergeant', 'Sergeant Major', 'Chief Sergeant',
+    'Second Lieutenant', 'First Lieutenant', 'Captain',
+}
+-- The badge as "Obtained key item: <abbr> Wildcat badge." names it, lowercased.
+-- PSC, PFC and SP are verified from chatlogs; the rest follow the key item names.
+local ASSAULT_RANK_ABBR = {
+    psc = 1, pfc = 2, sp = 3, lc = 4, c = 5, s = 6, sm = 7, cs = 8, sl = 9, fl = 10, captain = 11,
+}
+local ASSAULT_RANKUP_NEEDED = 25
+-- Zones Assault missions are fought in (LSB zone ids).
+local ASSAULT_INSTANCE_ZONES = {
+    [55] = true,   -- Ilrusi Atoll
+    [56] = true,   -- Periqia
+    [63] = true,   -- Lebros Cavern
+    [66] = true,   -- Mamool Ja Training Grounds
+    [69] = true,   -- Leujaoam Sanctum
+}
+
+-- ============================================================================
 -- State
 -- ============================================================================
 local save_path                             -- set in load_cb (addon.path available then)
@@ -608,6 +732,12 @@ local function set_quest_hidden(quest_name, hide)
         hidden_quests[quest_name] = nil
     end
     data._hidden = hidden_quests
+end
+
+-- Top-level save keys that are not characters: UI preferences, settings and
+-- the account-wide records (the Assault tag stock and the Ashu Talif week).
+local function is_char_key(name)
+    return name ~= '_hidden' and name ~= '_settings' and name ~= '_assault' and name ~= '_ashu'
 end
 
 -- Kill-mob tracking: when we see "defeats the X", we store the quest indices
@@ -683,6 +813,13 @@ local ki_name_to_id = {}
 
 -- keyed by log_id, value = { [0]=u32, ... [7]=u32 }
 local active_quest_blocks = {}
+
+-- The 0x056 port carrying the completed Aht Urhgan quests; its words 4-7 hold
+-- every completed Assault mission (see Assault Rank Config).
+local QUEST_COMPLETE_PORT_AHT_URHGAN = 0x00C0
+-- That block for the current character, { [0]=u32, ... [7]=u32 }, or nil
+-- until the server has sent it this session.
+local completed_toau_block = nil
 
 local QUEST_OFFER_PORT_TO_LOG_ID = {
     [0x0050] = 0,   -- San d'Oria
@@ -861,6 +998,11 @@ local function get_next_reset_time()
     return reset
 end
 
+-- The first JST midnight (15:00 UTC) strictly after t.
+local function next_jst_midnight(t)
+    return t - ((t + 9 * 3600) % 86400) + 86400
+end
+
 -- Format a duration in seconds as "Xd Xh Xm Xs"
 local function format_countdown(seconds)
     if seconds <= 0 then return 'NOW!' end
@@ -947,7 +1089,7 @@ local function load_data()
     -- and the registration that genuinely are per character.
     local adopted
     for cname, cdata in pairs(data) do
-        if cname ~= '_hidden' and cname ~= '_settings' and cname ~= '_assault'
+        if is_char_key(cname)
             and type(cdata) == 'table' and type(cdata.assault) == 'table'
             and cdata.assault.updated ~= nil then
             local a = cdata.assault
@@ -1198,6 +1340,7 @@ local function clear_packet_state()
     ki_bitmap = {}
     prev_ki_bitmap = {}
     active_quest_blocks = {}
+    completed_toau_block = nil
     last_derived_status = {}
     dynamis_active_session = nil
     dlog('Cleared packet-derived state (character change).')
@@ -1690,17 +1833,40 @@ local ECO_STATUS_COLORS = {
     ['Not Available']    = { 0.6, 0.6, 0.6, 1.0 },     -- grey
 }
 
+-- When a cooldown row's reward can be obtained again. Most rows run a number
+-- of days from the obtain; enm_resets_jst_daily rows lift at the next JST
+-- midnight instead.
+local function enm_ready_at(q, obtained)
+    if q.enm_resets_jst_daily then
+        return next_jst_midnight(obtained)
+    end
+    return obtained + (q.enm_cooldown_days or 5) * 86400
+end
+
+-- Starts (ts) or clears (nil) a cooldown row, and every row sharing its
+-- cooldown_group: those are one server-side lock shown once per key item.
+local function set_enm_cooldown(cd, q, ts)
+    if not cd.enms then cd.enms = {} end
+    for _, other in ipairs(QUESTS) do
+        if other.type == 'enm'
+            and (other == q or (q.cooldown_group and other.cooldown_group == q.cooldown_group)) then
+            if not cd.enms[other.name] then cd.enms[other.name] = {} end
+            cd.enms[other.name].ki_obtained_time = ts
+            cd.enms[other.name].notified_ready = nil  -- the next expiry alerts afresh
+        end
+    end
+end
+
 -- ENM cooldown status helper
 -- Returns: status_text, color, ready_time_text
 local function get_enm_status(enm_data, q)
-    local cooldown_secs = (q.enm_cooldown_days or 5) * 86400
     local obtained = enm_data and enm_data.ki_obtained_time or nil
 
     if not obtained then
         return 'READY', KI_COLOR_YES, '-'
     end
 
-    local ready_at = obtained + cooldown_secs
+    local ready_at = enm_ready_at(q, obtained)
     local now = os.time()
     local ready_str = format_time(ready_at)
 
@@ -1802,6 +1968,178 @@ local function note_assault_tag_drawn(a)
     a.max_tags = max_tags
     a.updated  = os.time()
 end
+
+-- ============================================================================
+-- Ashu Talif
+-- ============================================================================
+ashu.STATUS = {
+    paid   = { label = 'Paid',   color = STATUS_COLORS['NEED TO COMPLETE'] },
+    won    = { label = 'Won',    color = KI_COLOR_YES },
+    failed = { label = 'Failed', color = KI_COLOR_NO },
+}
+
+-- This week's account-wide record. A record left from an earlier week is
+-- replaced by an empty one: the chain resets with the weekly reset.
+function ashu.week()
+    local week = get_week_key()
+    local r = data._ashu
+    if type(r) ~= 'table' or r.week ~= week then
+        r = { week = week, stages = {} }
+        data._ashu = r
+    end
+    if type(r.stages) ~= 'table' then r.stages = {} end
+    return r
+end
+
+function ashu.stage(key)
+    for _, s in ipairs(ashu.STAGES) do
+        if s.key == key then return s end
+    end
+    return nil
+end
+
+-- Records a stage's status in this week's record, credited to char_name now.
+function ashu.record(key, status, char_name)
+    ashu.week().stages[key] = { status = status, by = char_name, at = os.time() }
+end
+
+-- OWNER DECISION (open): Horizon allows the chain once per week per account,
+-- but whether the first payment, the final win or each stage is what locks
+-- the other characters has not been decided. Until it is, nothing is
+-- claimed: return a short note (e.g. 'Locked this week') to show one on
+-- char_name's tab.
+function ashu.lock_note(char_name, week_record)
+    return nil
+end
+
+-- Chat for the current character (normalized, not injected).
+function ashu.on_chat(name, msg)
+    if string.find(msg, ashu.PAID_PHRASE, 1, true) then
+        for _, s in ipairs(ashu.STAGES) do
+            if string.find(msg, normalize_string(s.name), 1, true) then
+                local cd = ensure_char(name)
+                if not cd then return end
+                cd.ashu_pending = { stage = s.key, week = get_week_key() }
+                ashu.record(s.key, 'paid', name)
+                log(string.format('Ashu Talif: %s paid for %s.', name, s.name))
+                save_data()
+                return
+            end
+        end
+        return
+    end
+
+    local won    = string.find(msg, ashu.WON_PHRASE, 1, true) ~= nil
+    local failed = string.find(msg, ashu.FAILED_PHRASE, 1, true) ~= nil
+    if not won and not failed then return end
+    if get_current_zone_id() ~= ashu.ZONE_ID then return end
+
+    local cd = data[name]
+    local p  = cd and cd.ashu_pending
+    if not p or not p.stage then return end
+    if won and p.result == 'failed' then return end   -- a failure is final
+
+    p.result = failed and 'failed' or 'won'
+    ashu.record(p.stage, p.result, name)
+    local s = ashu.stage(p.stage)
+    log(string.format('Ashu Talif: %s %s.', s and s.name or tostring(p.stage), p.result))
+    save_data()
+end
+
+-- Zone-in for the current character. Leaving the ship once the run has a
+-- result closes the pending stage; leaving without one keeps it, since what
+-- Horizon does with an abandoned run is not known.
+function ashu.on_zone(name, zone_id)
+    if zone_id == ashu.ZONE_ID then return end
+    local cd = data[name]
+    if cd and cd.ashu_pending and cd.ashu_pending.result then
+        cd.ashu_pending = nil
+        save_data()
+    end
+end
+
+-- ============================================================================
+-- Assault Rank
+-- ============================================================================
+-- Whether `mission` had been cleared before, from the 0x056 completed block;
+-- nil when that block has not arrived this session or the mission is unknown.
+local function assault_cleared_before(mission)
+    if not completed_toau_block or not mission or mission <= 0 then return nil end
+    return is_bit_set_in_block(completed_toau_block, 128 + mission)
+end
+
+-- Mirrors the highest Wildcat badge held into the character's rank, for
+-- display only: it never touches the rank-up count (see Assault Rank Config).
+local function update_assault_rank(char_name, table_index)
+    local rank, in_table = nil, false
+    for i, ki_name in ipairs(ASSAULT_RANK_BADGES) do
+        local ki_id = resolve_ki_id(ki_name)
+        if ki_id and math.floor(ki_id / 512) == table_index then
+            in_table = true
+            if has_key_item(ki_id) then rank = i end
+        end
+    end
+    if not in_table or not rank then return end
+    local a = ensure_char_assault(ensure_char(char_name))
+    if a and a.rank ~= rank then
+        a.rank = rank
+        save_data()
+    end
+end
+
+-- "You gain <n> Assault points!" inside an Assault zone: +5 for a first
+-- clear, +1 for a repeat, +1 and estimated when it cannot be told.
+local function note_assault_clear(name, msg)
+    if not string.find(msg, 'you gain %d+ assault points?!') then return end
+    local zone = get_current_zone_id()
+    if not zone or not ASSAULT_INSTANCE_ZONES[zone] then return end
+    local a = ensure_char_assault(ensure_char(name))
+    if not a then return end
+    if a.rankup == nil then
+        log('Assault cleared - rank-up points are unknown; set them in the Config tab to start counting.')
+        return
+    end
+    local before = assault_cleared_before(a.current_assault)
+    local add = (before == false) and 5 or 1
+    if before == nil then a.rankup_est = true end
+    a.rankup = a.rankup + add
+    log(string.format('Assault cleared (%s): +%d rank-up point%s - %d/%d.',
+        before == nil and 'history unknown' or (before and 'repeat' or 'first time'),
+        add, add == 1 and '' or 's', a.rankup, ASSAULT_RANKUP_NEEDED))
+    save_data()
+end
+
+-- "Obtained key item: <abbr> Wildcat badge." - a promotion.
+local function note_assault_promotion(name, msg)
+    local abbr = string.match(msg, 'obtained key item: (%a+) wildcat badge')
+    local rank = abbr and ASSAULT_RANK_ABBR[abbr]
+    if not rank then return end
+    local a = ensure_char_assault(ensure_char(name))
+    if not a then return end
+    a.rank       = rank
+    a.rankup     = 0
+    a.rankup_est = nil
+    log(string.format('Promoted to %s - rank-up points restart at 0.', ASSAULT_RANK_NAMES[rank]))
+    save_data()
+end
+
+-- The 'Rank-up points' row: text and color.
+local function rankup_row(a)
+    if a and a.rank == #ASSAULT_RANK_NAMES then return 'Max rank', KI_COLOR_DIM end
+    if not a or a.rankup == nil then return 'Unknown - set in Config', KI_COLOR_DIM end
+    local est = a.rankup_est and '  (est.)' or ''
+    if a.rankup >= ASSAULT_RANKUP_NEEDED then
+        return string.format('%d / %d  - promotion ready (Naja Salaheem)%s',
+            a.rankup, ASSAULT_RANKUP_NEEDED, est), KI_COLOR_YES
+    end
+    return string.format('%d / %d  (%d to go)%s', a.rankup, ASSAULT_RANKUP_NEEDED,
+        ASSAULT_RANKUP_NEEDED - a.rankup, est), STATUS_COLORS['NEED TO COMPLETE']
+end
+
+-- The Config tab's rank-up number box ({ value }, as imgui.InputInt takes
+-- it). It shows -1 while the count is unknown: InputInt only reports an edit
+-- when the number changes, so an unknown shown as 0 could never be set to 0.
+local rankup_input = { -1 }
 
 -- ============================================================================
 -- EXP Band Inventory Scan
@@ -1932,25 +2270,29 @@ local function check_enm_alerts(char_name, is_login_check)
     if not cd or not cd.enms then return end
 
     local ready_names = {}
+    local named = {}   -- a cooldown_group is announced once, under its own name
 
     for _, q in ipairs(QUESTS) do
         if q.type == 'enm' then
             local enm_data = cd.enms[q.name]
             if enm_data then
-                local cooldown_secs = (q.enm_cooldown_days or 5) * 86400
                 local obtained = enm_data.ki_obtained_time
 
                 -- Determine if the ENM is ready
                 local is_ready = false
                 if not obtained then
                     is_ready = true   -- never obtained = always ready
-                elseif os.time() >= (obtained + cooldown_secs) then
+                elseif os.time() >= enm_ready_at(q, obtained) then
                     is_ready = true   -- cooldown expired
                 end
 
                 if is_ready and not enm_data.notified_ready then
                     enm_data.notified_ready = true
-                    ready_names[#ready_names + 1] = q.name
+                    local label = q.cooldown_group or q.name
+                    if not named[label] then
+                        named[label] = true
+                        ready_names[#ready_names + 1] = label
+                    end
                     dlog(string.format('ENM alert: %s is READY for %s', q.name, char_name))
                 end
             end
@@ -1996,11 +2338,10 @@ local function render_ui()
         imgui.Separator()
 
         -- Collect character names sorted alphabetically, current char first
-        -- Filter out the _hidden / _settings / _assault keys, which are not
-        -- characters
+        -- Filter out the keys that are not characters (see is_char_key)
         local char_names = {}
         for name, _ in pairs(data) do
-            if name ~= '_hidden' and name ~= '_settings' and name ~= '_assault' then
+            if is_char_key(name) then
                 char_names[#char_names + 1] = name
             end
         end
@@ -2180,11 +2521,11 @@ local function render_ui()
                     end
 
                     -- ==================================================
-                    -- ASSAULT TAGS SECTION (collapsible)
+                    -- ASSAULT SECTION (collapsible): tags, registration, rank
                     -- ==================================================
                     if not is_quest_hidden('Assault Tags') then
                         imgui.Spacing()
-                        if imgui.CollapsingHeader('Assault Tags', ImGuiTreeNodeFlags_DefaultOpen) then
+                        if imgui.CollapsingHeader('Assault', ImGuiTreeNodeFlags_DefaultOpen) then
                             -- The stock is one account-wide pool, so it reads
                             -- the same on every character's tab. Only the tag
                             -- in hand and the registration belong to this one.
@@ -2237,6 +2578,12 @@ local function render_ui()
                                 reg > 0 and assault_mission_name(reg) or '-',
                                 reg > 0 and KI_COLOR_YES or KI_COLOR_DIM }
 
+                            local rank = a and a.rank
+                            rows[#rows + 1] = { 'Rank', rank and ASSAULT_RANK_NAMES[rank] or 'Unknown - log in once',
+                                rank and KI_COLOR_YES or KI_COLOR_DIM }
+                            local rankup_text, rankup_color = rankup_row(a)
+                            rows[#rows + 1] = { 'Rank-up points', rankup_text, rankup_color }
+
                             if pool then
                                 rows[#rows + 1] = { 'Last read',
                                     string.format('%s by %s  (said %d)', format_time(pool.updated),
@@ -2273,11 +2620,93 @@ local function render_ui()
                     end
 
                     -- ==================================================
+                    -- ASHU TALIF SECTION (collapsible, account-wide)
+                    -- ==================================================
+                    if not is_quest_hidden('Ashu Talif') then
+                        imgui.Spacing()
+                        if imgui.CollapsingHeader('Ashu Talif (account, weekly)', ImGuiTreeNodeFlags_DefaultOpen) then
+                            -- One record for the whole account, so every tab
+                            -- shows the same rows.
+                            local week_rec = ashu.week()
+
+                            imgui.Columns(5, '##ashuCols', true)
+                            imgui.SetColumnWidth(0, 30)
+                            imgui.SetColumnWidth(1, 180)
+                            imgui.SetColumnWidth(2, 70)
+                            imgui.SetColumnWidth(3, 100)
+                            imgui.Text('')
+                            imgui.NextColumn()
+                            imgui.Text('Stage')
+                            imgui.NextColumn()
+                            imgui.Text('Status')
+                            imgui.NextColumn()
+                            imgui.Text('By')
+                            imgui.NextColumn()
+                            imgui.Text('When')
+                            imgui.NextColumn()
+                            imgui.Separator()
+
+                            for i, s in ipairs(ashu.STAGES) do
+                                -- Hide button (only on first row)
+                                if i == 1 then
+                                    imgui.PushID('hide_ashu')
+                                    if imgui.SmallButton('x') then
+                                        set_quest_hidden('Ashu Talif', true)
+                                        save_data()
+                                    end
+                                    imgui.PopID()
+                                else
+                                    imgui.Text('')
+                                end
+                                imgui.NextColumn()
+
+                                imgui.Text(s.name)
+                                imgui.NextColumn()
+
+                                local st    = week_rec.stages[s.key]
+                                local shown = st and ashu.STATUS[st.status]
+                                if shown then
+                                    imgui.TextColored(shown.color, shown.label)
+                                    imgui.NextColumn()
+                                    imgui.Text(st.by or '?')
+                                    imgui.NextColumn()
+                                    imgui.Text(format_time(st.at))
+                                else
+                                    imgui.TextColored(KI_COLOR_DIM, '-')
+                                    imgui.NextColumn()
+                                    imgui.Text('')
+                                    imgui.NextColumn()
+                                    imgui.Text('')
+                                end
+                                imgui.NextColumn()
+                            end
+
+                            imgui.Columns(1)
+
+                            -- A stage paid in an earlier week and not fought
+                            -- yet is still owed a fight.
+                            for _, other in ipairs(char_names) do
+                                local p = data[other] and data[other].ashu_pending
+                                if p and not p.result and p.week ~= week_rec.week then
+                                    local s = ashu.stage(p.stage)
+                                    imgui.TextColored(KI_COLOR_DIM, string.format('%s: %s paid in %s, not fought yet',
+                                        other, s and s.name or tostring(p.stage), tostring(p.week)))
+                                end
+                            end
+
+                            local note = ashu.lock_note(char_name, week_rec)
+                            if note then
+                                imgui.TextColored(KI_COLOR_NO, note)
+                            end
+                        end
+                    end
+
+                    -- ==================================================
                     -- ENM / LIMBUS SECTION (collapsible)
                     -- ==================================================
                     if #enm_quests > 0 then
                         imgui.Spacing()
-                        if imgui.CollapsingHeader('Cooldowns (ENM / Limbus / HAAP / Assault)', ImGuiTreeNodeFlags_DefaultOpen) then
+                        if imgui.CollapsingHeader('Cooldowns (ENM / Limbus / HAAP / Assault / ISNM)', ImGuiTreeNodeFlags_DefaultOpen) then
 
                             imgui.Columns(6, '##enmCols', true)
                             imgui.SetColumnWidth(0, 30)
@@ -2606,7 +3035,20 @@ local function render_ui()
                     end
                     imgui.PopID()
                     imgui.SameLine()
-                    imgui.Text('[Assault] Assault Tags (entire section)')
+                    imgui.Text('[Assault] Assault (entire section)')
+                end
+
+                -- Ashu Talif section
+                if is_quest_hidden('Ashu Talif') then
+                    any_hidden = true
+                    imgui.PushID('show_ashu_section')
+                    if imgui.SmallButton('Show') then
+                        set_quest_hidden('Ashu Talif', false)
+                        save_data()
+                    end
+                    imgui.PopID()
+                    imgui.SameLine()
+                    imgui.Text('[Ashu Talif] Ashu Talif (entire section)')
                 end
 
                 if not any_hidden then
@@ -2627,8 +3069,7 @@ local function render_ui()
                 -- Build character list
                 local override_chars = {}
                 for cname, cdata in pairs(data) do
-                    if cname ~= '_hidden' and cname ~= '_settings' and cname ~= '_assault'
-                        and type(cdata) == 'table' then
+                    if is_char_key(cname) and type(cdata) == 'table' then
                         override_chars[#override_chars + 1] = cname
                     end
                 end
@@ -2689,7 +3130,7 @@ local function render_ui()
 
                         -- ---- ENMs / Limbus ----
                         imgui.Spacing()
-                        if imgui.CollapsingHeader('Override: Cooldowns (ENM / Limbus / HAAP)##ovr_enm') then
+                        if imgui.CollapsingHeader('Override: Cooldowns (ENM / Limbus / HAAP / Assault / ISNM)##ovr_enm') then
                             for _, q in ipairs(QUESTS) do
                                 if q.type == 'enm' then
                                     if not ocd.enms then ocd.enms = {} end
@@ -2720,10 +3161,9 @@ local function render_ui()
 
                                     imgui.PushID('ovr_enm_cdn_' .. q.name)
                                     if imgui.SmallButton('Start CD') then
-                                        enm.ki_obtained_time = os.time()
-                                        enm.notified_ready = nil  -- reset alert flag
+                                        set_enm_cooldown(ocd, q, os.time())
                                         log(string.format('Manual override: %s [%s] cooldown started now',
-                                            q.name, override_selected_char))
+                                            q.cooldown_group or q.name, override_selected_char))
                                         save_data()
                                     end
                                     imgui.PopID()
@@ -2731,10 +3171,9 @@ local function render_ui()
 
                                     imgui.PushID('ovr_enm_cdc_' .. q.name)
                                     if imgui.SmallButton('Clear CD') then
-                                        enm.ki_obtained_time = nil
-                                        enm.notified_ready = nil  -- reset alert flag so READY alert fires
+                                        set_enm_cooldown(ocd, q, nil)
                                         log(string.format('Manual override: %s [%s] cooldown cleared',
-                                            q.name, override_selected_char))
+                                            q.cooldown_group or q.name, override_selected_char))
                                         save_data()
                                     end
                                     imgui.PopID()
@@ -2831,6 +3270,76 @@ local function render_ui()
                             end
                         end
 
+                        -- ---- Assault rank-up points ----
+                        imgui.Spacing()
+                        if imgui.CollapsingHeader('Override: Assault rank-up points##ovr_rankup') then
+                            local oa = ensure_char_assault(ocd)
+                            imgui.Text('Rank-up points: ' .. (oa.rankup == nil and 'Unknown' or (rankup_row(oa))))
+
+                            -- Type the value and press Enter (the box's -/+
+                            -- step by 1, or 5 with Ctrl). A negative value, or
+                            -- the Unknown button, forgets the count.
+                            local set, changed = oa.rankup, false
+                            rankup_input[1] = oa.rankup or -1
+                            imgui.PushID('ovr_rankup')
+                            imgui.PushItemWidth(110)
+                            if imgui.InputInt('##rankup_value', rankup_input, 1, 5, ImGuiInputTextFlags_EnterReturnsTrue) then
+                                set, changed = rankup_input[1] >= 0 and rankup_input[1] or nil, true
+                            end
+                            imgui.PopItemWidth()
+                            imgui.SameLine()
+                            if imgui.SmallButton('Unknown') then
+                                set, changed = nil, true
+                            end
+                            imgui.PopID()
+                            imgui.TextColored(KI_COLOR_DIM, 'Type the value and press Enter; -1 means unknown.')
+
+                            if changed then
+                                oa.rankup     = set
+                                oa.rankup_est = nil
+                                log(string.format('Manual override: rank-up points [%s] -> %s',
+                                    override_selected_char, tostring(oa.rankup)))
+                                save_data()
+                            end
+                        end
+
+                        -- ---- Ashu Talif (account-wide, this week) ----
+                        imgui.Spacing()
+                        if imgui.CollapsingHeader('Override: Ashu Talif (this week)##ovr_ashu') then
+                            local week_rec = ashu.week()
+                            for _, s in ipairs(ashu.STAGES) do
+                                local st = week_rec.stages[s.key]
+                                imgui.Text(string.format('%s: %s', s.name,
+                                    st and string.format('%s by %s', st.status, st.by or '?') or '-'))
+                                imgui.SameLine()
+
+                                imgui.PushID('ovr_ashu_won_' .. s.key)
+                                if imgui.SmallButton('Mark won') then
+                                    ashu.record(s.key, 'won', override_selected_char)
+                                    -- Settle the character's own paid stage too, or its
+                                    -- pending gate stays open and credits the next ship
+                                    -- win (e.g. The Black Coffin) to this stage.
+                                    local p = ocd.ashu_pending
+                                    if p and p.stage == s.key then
+                                        p.result = 'won'
+                                    end
+                                    log(string.format('Manual override: Ashu Talif %s won by %s',
+                                        s.name, override_selected_char))
+                                    save_data()
+                                end
+                                imgui.PopID()
+                                imgui.SameLine()
+
+                                imgui.PushID('ovr_ashu_clr_' .. s.key)
+                                if imgui.SmallButton('Clear') then
+                                    week_rec.stages[s.key] = nil
+                                    log(string.format('Manual override: Ashu Talif %s cleared', s.name))
+                                    save_data()
+                                end
+                                imgui.PopID()
+                            end
+                        end
+
                         -- ---- Dynamis ----
                         imgui.Spacing()
                         if imgui.CollapsingHeader('Override: Dynamis##ovr_dyn') then
@@ -2917,8 +3426,7 @@ ashita.events.register('load', 'weeklier_load_cb', function()
     -- Normalize every stored character so weekly rollover resets apply even
     -- to characters that haven't logged in since the reset.
     for cname, cdata in pairs(data) do
-        if cname ~= '_hidden' and cname ~= '_settings' and cname ~= '_assault'
-            and type(cdata) == 'table' then
+        if is_char_key(cname) and type(cdata) == 'table' then
             ensure_char(cname)
         end
     end
@@ -3118,6 +3626,34 @@ ashita.events.register('command', 'weeklier_command_cb', function(e)
         for i, entry in ipairs(cd_dyn) do
             log(string.format('    %d: zone=%s (id=%d) time=%s',
                 i, entry.zone or '??', entry.zone_id or 0, format_time(entry.time)))
+        end
+
+        -- Ashu Talif diagnostics
+        local week_rec = ashu.week()
+        for _, s in ipairs(ashu.STAGES) do
+            local st = week_rec.stages[s.key]
+            log(string.format('  [ASHU] %s: %s', s.name, st and string.format('%s by %s (%s)',
+                st.status, st.by or '?', format_time(st.at)) or '-'))
+        end
+        local p = data[char] and data[char].ashu_pending
+        log(string.format('  [ASHU] pending: %s', p and string.format('%s (paid in %s, result %s)',
+            tostring(p.stage), tostring(p.week), tostring(p.result)) or 'none'))
+
+        -- Assault rank diagnostics
+        local ca = data[char] and data[char].assault or {}
+        log(string.format('  [ASSAULT] rank=%s rankup=%s est=%s registered=%s',
+            tostring(ca.rank), tostring(ca.rankup), tostring(ca.rankup_est), tostring(ca.current_assault)))
+        if completed_toau_block then
+            local done = {}
+            for m = 1, 127 do
+                if is_bit_set_in_block(completed_toau_block, 128 + m) then
+                    done[#done + 1] = string.format('%d %s', m, assault_mission_name(m))
+                end
+            end
+            log('  [ASSAULT] completed missions (0x056 port 0x00C0): ' ..
+                (#done > 0 and table.concat(done, ', ') or 'none'))
+        else
+            log('  [ASSAULT] completed missions: not received this session (zone once)')
         end
 
         log('--- End Dump ---')
@@ -3355,18 +3891,27 @@ ashita.events.register('text_in', 'weeklier_text_in_cb', function(e)
                 if zone_ok then
                     local cd = ensure_char(name)
                     if cd then
-                        if not cd.enms then cd.enms = {} end
-                        if not cd.enms[q.name] then cd.enms[q.name] = {} end
-                        cd.enms[q.name].ki_obtained_time = os.time()
-                        cd.enms[q.name].notified_ready = nil  -- clear alert flag so next expiry triggers a new notification
-                        local cooldown = q.enm_cooldown_days or 5
-                        log(string.format('%s obtained - %d day cooldown started.', q.name, cooldown))
+                        set_enm_cooldown(cd, q, os.time())
+                        if q.enm_resets_jst_daily then
+                            log(string.format('%s obtained - locked until JST midnight (%s).',
+                                q.name, format_time(next_jst_midnight(os.time()))))
+                        else
+                            log(string.format('%s obtained - %d day cooldown started.',
+                                q.name, q.enm_cooldown_days or 5))
+                        end
                         save_data()
                     end
                 end
             end
         end
     end
+
+    -- ------------------------------------------------------------------
+    -- ToAU: Ashu Talif record, Assault clears and promotions
+    -- ------------------------------------------------------------------
+    ashu.on_chat(name, msg)
+    note_assault_clear(name, msg)
+    note_assault_promotion(name, msg)
 
     -- ------------------------------------------------------------------
     -- Eco Warrior flag_phrase detection
@@ -3576,6 +4121,11 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb', function(e)
         end
     end
 
+    -- Mercenary rank from the Wildcat badges (display only)
+    if char_name then
+        update_assault_rank(char_name, table_index)
+    end
+
     -- Detect KI removals (ki_quest_incomplete -> COMPLETED, ki_quest_active -> READY TO TURN IN or COMPLETED)
     if prev_ki_bitmap[table_index] then
         process_ki_removals(table_index)
@@ -3600,6 +4150,12 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_056_active_quests', f
 
     -- Port at offset 0x24 (uint16 LE)
     local port = u16le(pkt, 0x24 + 1)
+
+    if port == QUEST_COMPLETE_PORT_AHT_URHGAN then
+        completed_toau_block = read_u32x8(pkt)
+        return
+    end
+
     local log_id = QUEST_OFFER_PORT_TO_LOG_ID[port]
     if log_id == nil then
         return
@@ -3750,6 +4306,20 @@ ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_zone', function(e
     }
     persist_dynamis_session()
     dlog(string.format('Initialized Dynamis session: %s (placeholder expiry in 120s).', zone_name))
+end)
+
+-- ============================================================================
+-- Zone-In Packet (0x00A) - Ashu Talif runs
+-- ============================================================================
+-- Kept apart from the Dynamis handler above, which returns early for every
+-- zone that is not a Dynamis one.
+ashita.events.register('packet_in', 'weeklier_packet_in_cb_00A_ashu', function(e)
+    if e.id ~= 0x00A then return end
+    local pkt = e.data
+    if not pkt or #pkt < 0x34 then return end
+    local name = get_current_char_name()
+    if not name then return end
+    ashu.on_zone(name, u32le(pkt, 0x30 + 1))   -- ZoneNo, as the Dynamis handler reads it
 end)
 
 -- ============================================================================

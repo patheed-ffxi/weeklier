@@ -34,7 +34,7 @@ Pre-configured quests:
 - Spice Gals
 - Requiem of Sin
 
-### ENM / Limbus (Cooldown-Based)
+### Cooldowns (ENM / Limbus / HAAP / Assault / ISNM)
 
 ENMs and Limbus have an independent cooldown timer rather than following the weekly reset. ENMs typically have a 5-day cooldown, while Limbus has a 3-day cooldown. The addon tracks when the key item was obtained and displays a countdown until the next one can be acquired.
 
@@ -51,6 +51,12 @@ Pre-configured ENMs:
 
 Pre-configured Limbus:
 - Limbus (Cosmo-Cleanse, 3-day cooldown)
+
+Pre-configured ISNM orders (Shajaf, Aht Urhgan Whitegate):
+- ISNM Order (2000) - Confidential Imperial order, for the level-60 fights
+- ISNM Order (3000) - Secret Imperial order, for the uncapped fights
+
+A character can buy one order per JST day, whichever it is, so the two rows share one lock: buying either starts both, and they become READY together at the next JST midnight (15:00 UTC) rather than 24 hours later. Has KI shows which order is being held (an order can't be bought while one is held).
 
 ### Kill-Based Quests
 
@@ -89,11 +95,25 @@ Supported zones:
 - Dynamis - Beaucedine, Xarcabard
 - Dynamis - San d'Oria, Bastok, Windurst, Jeuno
 
-### Assault Tags
+### Ashu Talif (account, weekly)
+
+Halshaob's three quests in Nashmau - Scouting the Ashu Talif, Royal Painter Escort and Targeting the Captain - are fought in turn on The Ashu Talif. On HorizonXI the chain runs once a week for the whole account, so this section keeps **one record per account** and shows it on every character's tab: each stage as Paid, Won or Failed, with who and when. The record empties at the weekly reset.
+
+| Status | Meaning |
+|---|---|
+| Paid | Halshaob took the fee; the fight is still ahead |
+| Won | "Objective complete" on the ship |
+| Failed | "The mission has failed" on the ship - final, even after an objective-complete line |
+
+Stages are read from chat: Halshaob's "...in exchange fer lettin' you take on \<quest>" line, then the ship's objective-complete or mission-failed line. Ship lines only count for a character with a stage paid for, so The Black Coffin and other fights on the ship are not recorded. A stage paid for in an earlier week and not fought yet is listed under the table.
+
+The section records what happened; it does not say which characters are locked out for the week. The Config tab can mark a stage won or clear it.
+
+### Assault
 
 Tracks the Assault tag stock (banked Imperial Army I.D. tags). Tags are a server-side counter rather than a key item, so the only way to read them is to **talk to Rytaal in Aht Urhgan Whitegate** - the section shows "Unknown" until you do. One visit is enough: the addon stores the restock timer the NPC sends and projects the stock forward from it, so the count and countdowns stay correct without going back.
 
-On HorizonXI the stock is **shared across the whole account** - one pool of tags behind every character, restocking on one timer. The addon stores it once instead of per character, so a reading taken on any character shows on all of their tabs (labelled `Stock (account)`), a tag drawn on one is deducted for all of them, and `Last read` names the character the reading came from. Only `Holding tag` and `Registered` are per character, because a tag in hand is a key item and a sign-up is a registration - neither is part of the stock.
+On HorizonXI the stock is **shared across the whole account** - one pool of tags behind every character, restocking on one timer. The addon stores it once instead of per character, so a reading taken on any character shows on all of their tabs (labelled `Stock (account)`), a tag drawn on one is deducted for all of them, and `Last read` names the character the reading came from. Apart from the rank rows below, only `Holding tag` and `Registered` are per character, because a tag in hand is a key item and a sign-up is a registration - neither is part of the stock.
 
 The client never sends an account id, so there is nothing to group characters by: every character the addon tracks is taken to be on the one account. Two accounts played through the same Ashita install would share the one record.
 
@@ -120,16 +140,28 @@ A count projected past what the server actually reported is marked `(est.)`, and
 
 Save files written before 1.6 kept a stock on each character. They are migrated on first load: the most recent of those readings becomes the shared one, and the stock fields are dropped from the character entries.
 
+#### Rank and rank-up points
+
+`Rank` is the highest Wildcat badge the character holds.
+
+`Rank-up points` counts toward the 25 a promotion needs. The server keeps these as a hidden counter - **+5** for clearing a mission for the first time, **+1** for a repeat, nothing for a failure, back to 0 on promotion - and never sends it to the client, so weeklier counts clears itself:
+
+- A clear is the "You gain \<n> Assault points!" line inside an Assault zone (Leujaoam Sanctum, Mamool Ja Training Grounds, Lebros Cavern, Periqia or Ilrusi Atoll).
+- First or repeat comes from the list of completed missions the server sends with the quest log. If that list or the registered mission is unknown, the clear counts +1 and the value is marked `(est.)`.
+- A promotion - the new badge's "Obtained key item" line - restarts the count at 0.
+
+The starting value cannot be read from the game, so the row shows `Unknown - set in Config` until you enter it in the Config tab: type the value into the box and press Enter (the box's -/+ step it by 1, or by 5 with Ctrl; -1 or the Unknown button forgets it). Once set, it stays correct from clears and promotions. At 25 or more the row reads `promotion ready (Naja Salaheem)`.
+
 ## Detection Methods
 
 The addon uses multiple detection methods depending on the quest type:
 
 - **Packet 0x055 (Key Items)** - Monitors the key item bitmap to detect when quest-related KIs are obtained or removed. KI removal is used to detect quest completion or objective completion.
-- **Packet 0x056 (Quest Log)** - Reads the active quest bitmap to determine if a quest is currently flagged.
-- **Packet 0x00A (Zone-In)** - Detects when the player enters a Dynamis zone to track weekly entrances.
+- **Packet 0x056 (Quest Log)** - Reads the active quest bitmap to determine if a quest is currently flagged, and the completed Aht Urhgan block (port 0x00C0), whose words 4-7 list every completed Assault mission, to tell a first clear from a repeat.
+- **Packet 0x00A (Zone-In)** - Detects Dynamis zone-ins, and leaving The Ashu Talif after a run.
 - **Packet 0x034 (NPC Event)** - Reads the Assault tag stock and restock timer from Rytaal's event parameters, and the currently registered assault from the reception counters' events. Matched on event id (268 for Rytaal, 273-277 for the counters) in Aht Urhgan Whitegate rather than on NPC ids, which are not guaranteed to be identical across servers.
 - **Packet 0x05B (Event Option, outgoing)** - Reads the Assault mission picked at a reception counter, which the server never sends back in a packet of its own.
-- **Chat parsing** - Detects quest flag/completion phrases for bugged quests that don't appear correctly in the quest log. Also used to track Dynamis session timers (injected system messages) and Eco Warrior in-zone verification steps.
+- **Chat parsing** - Detects quest flag/completion phrases for bugged quests that don't appear correctly in the quest log. Also used to track Dynamis session timers (injected system messages), Eco Warrior in-zone verification steps, Ashu Talif payments and results, ISNM and ENM key items, Assault clears, and promotions.
 
 ## Installation
 
@@ -181,11 +213,11 @@ Click the `x` button next to any quest in the UI to hide it. Hidden quests can b
 
 ### Manual Status Override
 
-The Config tab provides a manual status override for any quest, ENM / Limbus, Eco Warrior nation, or Dynamis entry. This is useful for bootstrapping data on characters that have already completed content before installing the addon.
+The Config tab provides a manual status override for any quest, ENM / Limbus / ISNM cooldown, Eco Warrior nation, Dynamis entry, Assault rank-up points, or this week's Ashu Talif stages. This is useful for bootstrapping data on characters that have already completed content before installing the addon.
 
 ## Data Storage
 
-All data is saved to `char_data.json` in the addon directory. This includes per-character quest status, ENM / Limbus cooldown timers, Eco Warrior rotation history, Dynamis entry logs, the account-wide Assault tag stock, and UI preferences (hidden quests).
+All data is saved to `char_data.json` in the addon directory. This includes per-character quest status, ENM / Limbus / ISNM cooldown timers, Eco Warrior rotation history, Dynamis entry logs, Assault rank and rank-up points, the account-wide Assault tag stock and Ashu Talif week, and UI preferences (hidden quests).
 
 ## Dependencies
 
