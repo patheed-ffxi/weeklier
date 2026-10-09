@@ -2022,7 +2022,11 @@ function ashu.on_chat(name, msg)
             if string.find(msg, normalize_string(s.name), 1, true) then
                 local cd = ensure_char(name)
                 if not cd then return end
-                cd.ashu_pending = { stage = s.key, week = get_week_key() }
+                -- The client hands each line of NPC event dialog to text_in
+                -- three times; the repeats find this payment already noted.
+                local p, week = cd.ashu_pending, get_week_key()
+                if p and p.stage == s.key and p.week == week and not p.result then return end
+                cd.ashu_pending = { stage = s.key, week = week }
                 ashu.record(s.key, 'paid', name)
                 log(string.format('Ashu Talif: %s paid for %s.', name, s.name))
                 save_data()
