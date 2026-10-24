@@ -447,9 +447,10 @@ local DYNAMIS_MAX_ENTRIES = 2
 -- EXP Band Config
 -- ============================================================================
 -- Three EXP bands exist (Chariot/Empress/Emperor), but a player can only
--- hold one at a time. On zone-in, the player's Inventory, Wardrobe, and
--- Wardrobe2 are scanned for any of these item IDs. If found (and at least 1
--- charge remains), the next-use timestamp is read from item.Extra and stored.
+-- hold one at a time. On zone-in, the player's Inventory, Wardrobe,
+-- Wardrobe2, and Wardrobe3 are scanned for any of these item IDs. If found
+-- (and at least 1 charge remains), the next-use timestamp is read from
+-- item.Extra and stored.
 -- A chat notification fires when the cooldown expires (similar to ENM alerts).
 -- Stored per character in data[char].exp_band = {
 --   item_id      = numeric item id
@@ -477,12 +478,14 @@ local EXP_BAND_CONTAINER_MAXES = {
     Satchel   = 80,
     Wardrobe  = 80,
     Wardrobe2 = 80,
+    Wardrobe3 = 80,
 }
 local EXP_BAND_BAG_NAMES = {
     [0]  = 'Inventory',
     [5]  = 'Satchel',
     [8]  = 'Wardrobe',
     [10] = 'Wardrobe2',
+    [11] = 'Wardrobe3',
 }
 
 -- ============================================================================
@@ -2144,7 +2147,8 @@ local rankup_input = { -1 }
 -- ============================================================================
 -- EXP Band Inventory Scan
 -- ============================================================================
--- Scans Inventory / Wardrobe / Wardrobe2 for any of the EXP band item IDs.
+-- Scans Inventory / Wardrobe / Wardrobe2 / Wardrobe3 for any of the EXP band
+-- item IDs.
 -- For the first one found with at least 1 charge remaining, reads the
 -- next-use timestamp from item.Extra (bytes 5..8 = LE uint32 vana-relative)
 -- and stores it on the character record.
